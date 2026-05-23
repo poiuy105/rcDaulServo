@@ -26,8 +26,39 @@
 #include "esp_gatt_common_api.h"
 
 #include "owl_protocol.h"
+#include "driver/ledc.h"
 
 #define GATTS_TAG "OWL_SERVER"
+
+/*============================================================================
+ *                              舵机 PWM 配置
+ *============================================================================*/
+
+// GPIO 定义
+#define SERVO_X_GPIO        3
+#define SERVO_Y_GPIO        4
+
+// LEDC 配置
+#define LEDC_TIMER          LEDC_TIMER_0
+#define LEDC_MODE           LEDC_LOW_SPEED_MODE
+#define LEDC_X_CHANNEL      LEDC_CHANNEL_0
+#define LEDC_Y_CHANNEL      LEDC_CHANNEL_1
+#define LEDC_DUTY_RES       LEDC_TIMER_12_BIT
+#define LEDC_FREQUENCY      50  // 50Hz = 20ms 周期
+
+// 舵机角度映射 (MG996R: 0.5ms-2.5ms 脉宽)
+// 12bit分辨率: 0-4095
+// 50Hz时, 20ms = 4095 ticks
+// 0.5ms = 102 ticks (2.5%)
+// 1.5ms = 307 ticks (7.5%)
+// 2.5ms = 512 ticks (12.5%)
+#define SERVO_MIN_DUTY      102   // 0°
+#define SERVO_MAX_DUTY      512   // 180°
+#define SERVO_MID_DUTY      307   // 90°
+
+// 当前舵机角度
+static uint8_t servo_x_angle = 90;
+static uint8_t servo_y_angle = 90;
 
 /*============================================================================
  *                              GATT 定义
@@ -220,6 +251,64 @@ static struct gatts_profile_inst gl_profile = {
  *                              协议解析函数
  *============================================================================*/
 
+// 初始化舵机 PWM
+static void servo_init(void) {
+    // 配置定时器
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .timer_num        = LEDC_TIMER,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // 配置X轴舵机通道
+    ledc_channel_config_t ledc_x_channel = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_X_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = SERVO_X_GPIO,
+        .duty           = SERVO_MID_DUTY,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_x_channel));
+
+    // 配置Y轴舵机通道
+    ledc_channel_config_t ledc_y_channel = {
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_Y_CHANNEL,
+        .timer_sel      = LEDC_TIMER,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = SERVO_Y_GPIO,
+        .duty           = SERVO_MID_DUTY,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_y_channel));
+
+    ESP_LOGI(GATTS_TAG, "舵机 PWM 初始化完成");
+    ESP_LOGI(GATTS_TAG, "  X轴: GPIO%d, 初始角度 90°", SERVO_X_GPIO);
+    ESP_LOGI(GATTS_TAG, "  Y轴: GPIO%d, 初始角度 90°", SERVO_Y_GPIO);
+}
+
+// 设置舵机角度
+static void servo_set_angle(uint8_t channel, uint8_t angle) {
+    // 限制角度范围 0-180
+    if (angle > 180) angle = 180;
+    
+    // 角度映射到duty
+    uint32_t duty = SERVO_MIN_DUTY + (angle * (SERVO_MAX_DUTY - SERVO_MIN_DUTY) / 180);
+    
+    ledc_set_duty(LEDC_MODE, channel, duty);
+    ledc_update_duty(LEDC_MODE, channel);
+}
+
+// JOYSTICK值(0-255)映射到角度(0-180)
+static uint8_t joystick_to_angle(uint8_t joystick_val) {
+    return (joystick_val * 180) / 255;
+}
+
 static void parse_joystick_packet(owl_joystick_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "=== JOYSTICK 包 ===");
     ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
@@ -234,6 +323,22 @@ static void parse_joystick_packet(owl_joystick_pkt_t *pkt) {
         ESP_LOGW(GATTS_TAG, "  ⚠️ 检测到丢包! 丢失 %d 个包", seq_diff - 1);
     }
     last_seq = pkt->header.seq;
+    
+    // 更新舵机角度
+    uint8_t new_x_angle = joystick_to_angle(pkt->x_axis);
+    uint8_t new_y_angle = joystick_to_angle(pkt->y_axis);
+    
+    if (new_x_angle != servo_x_angle) {
+        servo_x_angle = new_x_angle;
+        servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
+        ESP_LOGI(GATTS_TAG, "  → X舵机更新: %d°", servo_x_angle);
+    }
+    
+    if (new_y_angle != servo_y_angle) {
+        servo_y_angle = new_y_angle;
+        servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
+        ESP_LOGI(GATTS_TAG, "  → Y舵机更新: %d°", servo_y_angle);
+    }
 }
 
 static void parse_switch_packet(owl_switch_pkt_t *pkt) {
@@ -610,6 +715,9 @@ void app_main(void) {
     if (ret) {
         ESP_LOGE(GATTS_TAG, "设置 MTU 失败: %x", ret);
     }
+
+    // 初始化舵机
+    servo_init();
 
     ESP_LOGI(GATTS_TAG, "猫头鹰 BLE 服务端初始化完成");
     ESP_LOGI(GATTS_TAG, "设备名: %s", OWL_DEVICE_NAME);
