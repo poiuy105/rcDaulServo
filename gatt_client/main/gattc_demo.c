@@ -23,6 +23,7 @@
 #include "esp_gatt_defs.h"
 #include "esp_bt_main.h"
 #include "esp_gatt_common_api.h"
+#include "esp_timer.h"
 
 #include "owl_protocol.h"
 
@@ -296,22 +297,21 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         
     case ESP_GATTC_SEARCH_CMPL_EVT:
         if (get_server) {
-            // 获取特征值
-            esp_gattc_char_elem_t *char_elem_result = NULL;
-            uint16_t count = 0;
+            // 获取特征值句柄
+            esp_gattc_char_elem_t char_result;
+            esp_bt_uuid_t char_uuid;
             
             // 获取控制通道特征值
-            esp_bt_uuid_t char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = REMOTE_CHAR_CONTROL_UUID};
-            esp_ble_gattc_get_attr_count(gl_profile.gattc_if, gl_profile.conn_id,
-                                         ESP_GATT_DB_CHARACTERISTIC,
-                                         gl_profile.service_start_handle,
-                                         gl_profile.service_end_handle,
-                                         INVALID_HANDLE, &count, &char_elem_result);
+            char_uuid.len = ESP_UUID_LEN_16;
+            char_uuid.uuid.uuid16 = REMOTE_CHAR_CONTROL_UUID;
             
-            if (count > 0 && char_elem_result != NULL) {
-                char_control_handle = char_elem_result[0].char_handle;
+            esp_err_t ret = esp_ble_gattc_get_char_by_uuid(gl_profile.gattc_if, gl_profile.conn_id,
+                                                           gl_profile.service_start_handle,
+                                                           gl_profile.service_end_handle,
+                                                           char_uuid, &char_result);
+            if (ret == ESP_OK) {
+                char_control_handle = char_result.char_handle;
                 ESP_LOGI(GATTC_TAG, "控制通道特征值: handle=%d", char_control_handle);
-                free(char_elem_result);
             }
             
             // 启动测试定时器
