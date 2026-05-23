@@ -157,6 +157,10 @@ static void ws2812_startup_animation(void) {
     led_strip_clear(led_strip);
 }
 
+// LED状态更新函数前置声明
+static void ws2812_update_connection(bool connected);
+static void ws2812_update_battery(uint8_t battery_percent);
+
 // 配对成功动画
 static void ws2812_pairing_animation(void) {
     for (int i = 0; i < 3; i++) {
@@ -176,7 +180,7 @@ static void ws2812_pairing_animation(void) {
     ws2812_update_battery(70);
 }
 
-// LED状态更新函数
+// LED状态更新函数定义
 static void ws2812_update_connection(bool connected) {
     ws2812_set_led(LED_CONN, connected ? COLOR_GREEN : COLOR_RED);
 }
