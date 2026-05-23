@@ -171,6 +171,9 @@ static void ws2812_pairing_animation(void) {
         led_strip_clear(led_strip);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
+    // 动画结束后恢复连接和电量显示
+    ws2812_update_connection(true);
+    ws2812_update_battery(70);
 }
 
 // LED状态更新函数
