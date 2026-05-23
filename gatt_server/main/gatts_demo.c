@@ -27,6 +27,7 @@
 
 #include "owl_protocol.h"
 #include "driver/ledc.h"
+#include "esp_timer.h"
 
 #define GATTS_TAG "OWL_SERVER"
 
