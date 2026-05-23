@@ -33,6 +33,13 @@ extern "C" {
 /** 设备名称 */
 #define OWL_DEVICE_NAME             "OWL_TOY"
 
+/** 绑定信息 Magic */
+#define OWL_BINDING_MAGIC           0xAB
+
+/** NVS 命名空间 */
+#define OWL_NVS_NAMESPACE           "owl_binding"
+#define OWL_KEY_REMOTE_MAC          "remote_mac"
+
 /*============================================================================
  *                              协议版本
  *============================================================================*/

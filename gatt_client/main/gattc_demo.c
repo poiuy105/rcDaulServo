@@ -65,6 +65,82 @@ static uint16_t char_command_handle = INVALID_HANDLE;
 static esp_timer_handle_t test_timer;
 
 /*============================================================================
+ *                              MAC 绑定功能
+ *============================================================================*/
+
+// 绑定状态
+static bool g_is_bound = false;
+static uint8_t g_bound_mac[6] = {0};
+
+// 加载绑定的 MAC 地址
+static void load_bound_mac(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    size_t length = 6;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(GATTC_TAG, "NVS 未初始化，无绑定信息");
+        g_is_bound = false;
+        return;
+    }
+    
+    err = nvs_get_blob(nvs_handle, OWL_KEY_REMOTE_MAC, g_bound_mac, &length);
+    if (err == ESP_OK && length == 6) {
+        g_is_bound = true;
+        ESP_LOGI(GATTC_TAG, "已绑定猫头鹰 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(g_bound_mac));
+    } else {
+        g_is_bound = false;
+        ESP_LOGI(GATTC_TAG, "无绑定信息，将自动绑定首个连接的设备");
+    }
+    
+    nvs_close(nvs_handle);
+}
+
+// 保存绑定的 MAC 地址
+static void save_bound_mac(uint8_t *mac) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "NVS 打开失败");
+        return;
+    }
+    
+    err = nvs_set_blob(nvs_handle, OWL_KEY_REMOTE_MAC, mac, 6);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            memcpy(g_bound_mac, mac, 6);
+            g_is_bound = true;
+            ESP_LOGI(GATTC_TAG, "猫头鹰 MAC 已保存: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(mac));
+        }
+    }
+    
+    nvs_close(nvs_handle);
+}
+
+// 清除绑定
+static void clear_bound_mac(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) return;
+    
+    err = nvs_erase_key(nvs_handle, OWL_KEY_REMOTE_MAC);
+    if (err == ESP_OK) {
+        nvs_commit(nvs_handle);
+    }
+    
+    nvs_close(nvs_handle);
+    g_is_bound = false;
+    memset(g_bound_mac, 0, 6);
+    ESP_LOGI(GATTC_TAG, "绑定信息已清除");
+}
+
+/*============================================================================
  *                              扫描参数
  *============================================================================*/
 
@@ -241,6 +317,18 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 ESP_LOGI(GATTC_TAG, "发现目标设备: %s", target_device_name);
                 ESP_LOGI(GATTC_TAG, "地址: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->scan_rst.bda));
                 
+                // 检查是否已绑定该设备
+                if (g_is_bound) {
+                    if (memcmp(param->scan_rst.bda, g_bound_mac, 6) == 0) {
+                        ESP_LOGI(GATTC_TAG, "✅ 发现已绑定的猫头鹰，准备连接");
+                    } else {
+                        ESP_LOGW(GATTC_TAG, "⚠️ 发现其他猫头鹰，跳过 (已绑定其他设备)");
+                        return;  // 跳过未绑定的设备
+                    }
+                } else {
+                    ESP_LOGI(GATTC_TAG, "未绑定状态，将绑定此设备");
+                }
+                
                 // 停止扫描并连接
                 esp_ble_gap_stop_scanning();
                 esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
@@ -276,8 +364,15 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
             break;
         }
         ESP_LOGI(GATTC_TAG, "连接成功");
+        ESP_LOGI(GATTC_TAG, "猫头鹰 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->open.remote_bda));
         gl_profile.conn_id = param->open.conn_id;
         memcpy(gl_profile.remote_bda, param->open.remote_bda, sizeof(esp_bd_addr_t));
+        
+        // 首次连接，保存绑定信息
+        if (!g_is_bound) {
+            save_bound_mac(param->open.remote_bda);
+        }
+        
         esp_ble_gattc_send_mtu_req(gattc_if, param->open.conn_id);
         break;
         
@@ -398,6 +493,9 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // 加载绑定信息
+    load_bound_mac();
 
     // 释放经典蓝牙内存
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));

@@ -53,6 +53,90 @@ static uint16_t local_mtu = 23;
 static uint8_t last_seq = 0;
 
 /*============================================================================
+ *                              MAC 绑定功能
+ *============================================================================*/
+
+// 绑定状态
+static bool g_is_bound = false;
+static uint8_t g_bound_mac[6] = {0};
+
+// 加载绑定的 MAC 地址
+static void load_bound_mac(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    size_t length = 6;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(GATTS_TAG, "NVS 未初始化，无绑定信息");
+        g_is_bound = false;
+        return;
+    }
+    
+    err = nvs_get_blob(nvs_handle, OWL_KEY_REMOTE_MAC, g_bound_mac, &length);
+    if (err == ESP_OK && length == 6) {
+        g_is_bound = true;
+        ESP_LOGI(GATTS_TAG, "已绑定设备 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(g_bound_mac));
+    } else {
+        g_is_bound = false;
+        ESP_LOGI(GATTS_TAG, "无绑定设备");
+    }
+    
+    nvs_close(nvs_handle);
+}
+
+// 保存绑定的 MAC 地址
+static void save_bound_mac(uint8_t *mac) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "NVS 打开失败");
+        return;
+    }
+    
+    err = nvs_set_blob(nvs_handle, OWL_KEY_REMOTE_MAC, mac, 6);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            memcpy(g_bound_mac, mac, 6);
+            g_is_bound = true;
+            ESP_LOGI(GATTS_TAG, "绑定设备 MAC 已保存: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(mac));
+        }
+    }
+    
+    nvs_close(nvs_handle);
+}
+
+// 清除绑定
+static void clear_bound_mac(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    err = nvs_open(OWL_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) return;
+    
+    err = nvs_erase_key(nvs_handle, OWL_KEY_REMOTE_MAC);
+    if (err == ESP_OK) {
+        nvs_commit(nvs_handle);
+    }
+    
+    nvs_close(nvs_handle);
+    g_is_bound = false;
+    memset(g_bound_mac, 0, 6);
+    ESP_LOGI(GATTS_TAG, "绑定信息已清除");
+}
+
+// 验证 MAC 地址
+static bool verify_mac(uint8_t *mac) {
+    if (!g_is_bound) {
+        return true;  // 未绑定状态，允许任何设备连接
+    }
+    return (memcmp(mac, g_bound_mac, 6) == 0);
+}
+
+/*============================================================================
  *                              广播数据
  *============================================================================*/
 
@@ -358,8 +442,26 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         ESP_LOGI(GATTS_TAG, "服务启动成功");
         break;
         
-    case ESP_GATTS_CONNECT_EVT:
+    case ESP_GATTS_CONNECT_EVT: {
         ESP_LOGI(GATTS_TAG, "客户端连接, conn_id=%d", param->connect.conn_id);
+        ESP_LOGI(GATTS_TAG, "客户端 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->connect.remote_bda));
+        
+        // MAC 地址验证
+        if (!verify_mac(param->connect.remote_bda)) {
+            ESP_LOGW(GATTS_TAG, "⚠️ 未授权设备，断开连接!");
+            ESP_LOGW(GATTS_TAG, "期望 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(g_bound_mac));
+            esp_ble_gap_disconnect(param->connect.remote_bda);
+            break;
+        }
+        
+        // 首次连接，自动绑定
+        if (!g_is_bound) {
+            ESP_LOGI(GATTS_TAG, "首次连接，自动绑定设备");
+            save_bound_mac(param->connect.remote_bda);
+        } else {
+            ESP_LOGI(GATTS_TAG, "✅ 已绑定设备连接成功");
+        }
+        
         gl_profile.conn_id = param->connect.conn_id;
         
         // 更新连接参数
@@ -371,6 +473,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         conn_params.timeout = 400;     // 4000ms
         esp_ble_gap_update_conn_params(&conn_params);
         break;
+    }
         
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(GATTS_TAG, "客户端断开, reason=0x%02x", param->disconnect.reason);
@@ -447,6 +550,9 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // 加载绑定信息
+    load_bound_mac();
 
     // 释放经典蓝牙内存
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
