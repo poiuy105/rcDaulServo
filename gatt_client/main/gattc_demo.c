@@ -26,8 +26,75 @@
 #include "esp_timer.h"
 
 #include "owl_protocol.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/gpio.h"
 
 #define GATTC_TAG "OWL_CLIENT"
+
+/*============================================================================
+ *                              摇杆 ADC 配置
+ *============================================================================*/
+
+// GPIO 定义
+#define JOYSTICK_X_GPIO     3
+#define JOYSTICK_Y_GPIO     4
+#define JOYSTICK_BTN_GPIO   9
+
+// ADC 配置
+#define JOYSTICK_ADC_UNIT   ADC_UNIT_1
+#define JOYSTICK_X_CHANNEL  ADC_CHANNEL_3   // IO3
+#define JOYSTICK_Y_CHANNEL  ADC_CHANNEL_4   // IO4
+
+// ADC句柄
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+
+// 初始化摇杆ADC
+static void joystick_adc_init(void) {
+    // 初始化ADC单元
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = JOYSTICK_ADC_UNIT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
+
+    // 配置X轴通道
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, JOYSTICK_X_CHANNEL, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, JOYSTICK_Y_CHANNEL, &config));
+
+    // 配置按键GPIO
+    gpio_config_t btn_conf = {
+        .pin_bit_mask = (1ULL << JOYSTICK_BTN_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_conf));
+
+    ESP_LOGI(GATTC_TAG, "摇杆ADC初始化完成");
+    ESP_LOGI(GATTC_TAG, "  X轴: GPIO%d (ADC1_CH%d)", JOYSTICK_X_GPIO, JOYSTICK_X_CHANNEL);
+    ESP_LOGI(GATTC_TAG, "  Y轴: GPIO%d (ADC1_CH%d)", JOYSTICK_Y_GPIO, JOYSTICK_Y_CHANNEL);
+    ESP_LOGI(GATTC_TAG, "  按键: GPIO%d", JOYSTICK_BTN_GPIO);
+}
+
+// 读取摇杆值
+static void joystick_read(uint8_t *x, uint8_t *y, uint8_t *btn) {
+    int raw_x = 0, raw_y = 0;
+    
+    // 读取ADC原始值 (0-4095)
+    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOYSTICK_X_CHANNEL, &raw_x));
+    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOYSTICK_Y_CHANNEL, &raw_y));
+    
+    // 映射到0-255
+    *x = (uint8_t)((raw_x * 255) / 4095);
+    *y = (uint8_t)((raw_y * 255) / 4095);
+    
+    // 读取按键（按下为低电平）
+    *btn = (gpio_get_level(JOYSTICK_BTN_GPIO) == 0) ? 1 : 0;
+}
 
 /*============================================================================
  *                              GATT 定义
@@ -220,6 +287,27 @@ static void build_command_packet(owl_command_pkt_t *pkt, uint8_t cmd, uint8_t pa
  *                              测试数据发送
  *============================================================================*/
 
+static void send_joystick_data(void *arg) {
+    if (!connect || char_control_handle == INVALID_HANDLE) {
+        return;
+    }
+    
+    // 读取真实摇杆值
+    uint8_t x, y, btn;
+    joystick_read(&x, &y, &btn);
+    
+    // 发送摇杆数据
+    owl_joystick_pkt_t pkt;
+    build_joystick_packet(&pkt, x, y, btn);
+    ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
+    ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
+    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
+                             char_control_handle,
+                             sizeof(pkt), (uint8_t*)&pkt,
+                             ESP_GATT_WRITE_TYPE_NO_RSP,
+                             ESP_GATT_AUTH_REQ_NONE);
+}
+
 static void send_test_data(void *arg) {
     if (!connect || char_control_handle == INVALID_HANDLE) {
         return;
@@ -227,47 +315,13 @@ static void send_test_data(void *arg) {
     
     static int test_phase = 0;
     
-    switch (test_phase % 4) {
+    switch (test_phase % 2) {
         case 0: {
-            // 发送摇杆数据
-            owl_joystick_pkt_t pkt;
-            build_joystick_packet(&pkt, 128, 128, 0);  // 中点，按键松开
-            ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包");
-            ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%d", pkt.x_axis, pkt.y_axis, pkt.button_flags);
-            esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                                     char_control_handle,
-                                     sizeof(pkt), (uint8_t*)&pkt,
-                                     ESP_GATT_WRITE_TYPE_NO_RSP,
-                                     ESP_GATT_AUTH_REQ_NONE);
+            // 发送真实摇杆数据
+            send_joystick_data(arg);
             break;
         }
         case 1: {
-            // 发送摇杆数据（移动）
-            owl_joystick_pkt_t pkt;
-            build_joystick_packet(&pkt, 200, 100, 1);  // 右上，按键按下
-            ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包");
-            ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%d", pkt.x_axis, pkt.y_axis, pkt.button_flags);
-            esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                                     char_control_handle,
-                                     sizeof(pkt), (uint8_t*)&pkt,
-                                     ESP_GATT_WRITE_TYPE_NO_RSP,
-                                     ESP_GATT_AUTH_REQ_NONE);
-            break;
-        }
-        case 2: {
-            // 发送开关数据
-            owl_switch_pkt_t pkt;
-            build_switch_packet(&pkt, OWL_SW_UP | OWL_SW_CENTER, OWL_SW_RIGHT);
-            ESP_LOGI(GATTC_TAG, ">>> 发送 SWITCH 包");
-            ESP_LOGI(GATTC_TAG, "    开关1=0x%02X, 开关2=0x%02X", pkt.switch1, pkt.switch2);
-            esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                                     char_control_handle,
-                                     sizeof(pkt), (uint8_t*)&pkt,
-                                     ESP_GATT_WRITE_TYPE_NO_RSP,
-                                     ESP_GATT_AUTH_REQ_NONE);
-            break;
-        }
-        case 3: {
             // 发送心跳数据
             owl_heartbeat_pkt_t pkt;
             build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
@@ -553,6 +607,9 @@ void app_main(void) {
     if (ret) {
         ESP_LOGE(GATTC_TAG, "设置 MTU 失败: %x", ret);
     }
+
+    // 初始化摇杆ADC
+    joystick_adc_init();
 
     ESP_LOGI(GATTC_TAG, "猫头鹰 BLE 客户端初始化完成");
     ESP_LOGI(GATTC_TAG, "目标设备: %s", target_device_name);
