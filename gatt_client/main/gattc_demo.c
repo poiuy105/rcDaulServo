@@ -33,6 +33,14 @@
 
 #define GATTC_TAG "OWL_CLIENT"
 
+// 心跳超时配置
+#define HEARTBEAT_TIMEOUT_MS    3000    // 3秒无心跳认为断线
+#define RECONNECT_DELAY_MS      2000    // 断线后2秒开始重连
+
+// 心跳检测变量
+static int64_t last_heartbeat_time = 0;
+static bool heartbeat_timeout = false;
+
 /*============================================================================
  *                              WS2812 LED 配置
  *============================================================================*/
@@ -627,6 +635,9 @@ static void send_heartbeat_data(void) {
                              sizeof(pkt), (uint8_t*)&pkt,
                              ESP_GATT_WRITE_TYPE_NO_RSP,
                              ESP_GATT_AUTH_REQ_NONE);
+    
+    // 更新心跳时间
+    last_heartbeat_time = esp_timer_get_time() / 1000;
 }
 
 // 定时器回调：发送摇杆和心跳数据
@@ -690,6 +701,28 @@ static void key_scan_task(void *arg) {
         
         // 10ms扫描一次
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// 心跳检测任务
+static void heartbeat_monitor_task(void *arg) {
+    while (1) {
+        if (connect) {
+            int64_t now = esp_timer_get_time() / 1000;  // 转换为ms
+            
+            // 检查心跳超时
+            if (last_heartbeat_time > 0 && (now - last_heartbeat_time) > HEARTBEAT_TIMEOUT_MS) {
+                if (!heartbeat_timeout) {
+                    heartbeat_timeout = true;
+                    ESP_LOGW(GATTC_TAG, "⚠️ 心跳超时！可能已断线");
+                    ws2812_update_connection(false);  // LED变红色
+                }
+            } else {
+                heartbeat_timeout = false;
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));  // 每秒检查一次
     }
 }
 
@@ -837,6 +870,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
                 
+                // 初始化心跳时间
+                last_heartbeat_time = esp_timer_get_time() / 1000;
+                heartbeat_timeout = false;
+                
                 // 更新LED状态：已连接
                 ws2812_update_connection(true);
                 ws2812_update_battery(70);  // 模拟电量70%
@@ -856,6 +893,13 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                     xTaskCreate(key_scan_task, "key_scan", 2048, NULL, 5, NULL);
                     key_task_started = true;
                 }
+                
+                // 启动心跳检测任务（只启动一次）
+                static bool heartbeat_task_started = false;
+                if (!heartbeat_task_started) {
+                    xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
+                    heartbeat_task_started = true;
+                }
             }
         }
         break;
@@ -865,6 +909,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         connect = false;
         get_server = false;
         char_control_handle = INVALID_HANDLE;
+        last_heartbeat_time = 0;
         // 重置各序列号
         seq_joystick = 0;
         seq_heartbeat = 0;
@@ -875,6 +920,9 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
             esp_timer_delete(test_timer);
             test_timer = NULL;
         }
+        
+        // 更新LED状态：未连接
+        ws2812_update_connection(false);
         
         // 重新扫描
         esp_ble_gap_set_scan_params(&ble_scan_params);

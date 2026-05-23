@@ -30,6 +30,14 @@
 
 #define GATTS_TAG "OWL_SERVER"
 
+// 心跳超时配置
+#define HEARTBEAT_TIMEOUT_MS    5000    // 5秒无心跳认为断线
+
+// 心跳检测变量
+static int64_t last_heartbeat_time = 0;
+static esp_gatt_if_t gatts_if_global = 0;
+static uint16_t conn_id_global = 0;
+
 /*============================================================================
  *                              舵机 PWM 配置
  *============================================================================*/
@@ -121,8 +129,29 @@ static char owl_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = OWL_DEVICE_NAME;
 // MTU
 static uint16_t local_mtu = 23;
 
-// 序列号跟踪
+// 序列号
 static uint8_t last_seq = 0;
+
+// 心跳检测任务
+static void heartbeat_monitor_task(void *arg) {
+    while (1) {
+        if (last_heartbeat_time > 0) {
+            int64_t now = esp_timer_get_time() / 1000;
+            
+            // 检查心跳超时
+            if ((now - last_heartbeat_time) > HEARTBEAT_TIMEOUT_MS) {
+                ESP_LOGW(GATTS_TAG, "⚠️ 心跳超时！客户端可能已断线");
+                // 主动断开连接，让客户端重新连接
+                if (conn_id_global > 0) {
+                    esp_ble_gatts_close(gatts_if_global, conn_id_global);
+                }
+                last_heartbeat_time = 0;
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 /*============================================================================
  *                              MAC 绑定功能
@@ -436,6 +465,9 @@ static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
     ESP_LOGI(GATTS_TAG, "  状态: 0x%02X", pkt->status);
     ESP_LOGI(GATTS_TAG, "  电池: %d.%dV", pkt->battery / 10, pkt->battery % 10);
+    
+    // 更新心跳时间
+    last_heartbeat_time = esp_timer_get_time() / 1000;
 }
 
 static void parse_command_packet(owl_command_pkt_t *pkt) {
@@ -639,6 +671,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         }
         
         gl_profile.conn_id = param->connect.conn_id;
+        gatts_if_global = gatts_if;
+        conn_id_global = param->connect.conn_id;
+        
+        // 初始化心跳时间
+        last_heartbeat_time = esp_timer_get_time() / 1000;
         
         // 更新连接参数
         esp_ble_conn_update_params_t conn_params = {0};
@@ -656,6 +693,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         esp_ble_gap_start_advertising(&adv_params);
         local_mtu = 23;
         last_seq = 0;
+        last_heartbeat_time = 0;
         break;
         
     case ESP_GATTS_WRITE_EVT:
@@ -792,6 +830,9 @@ void app_main(void) {
 
     // 初始化继电器
     relay_init();
+
+    // 启动心跳检测任务
+    xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
 
     ESP_LOGI(GATTS_TAG, "猫头鹰 BLE 服务端初始化完成");
     ESP_LOGI(GATTS_TAG, "设备名: %s", OWL_DEVICE_NAME);
