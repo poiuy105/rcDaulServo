@@ -1,0 +1,27 @@
+# ESP-IDF build directories
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+
+# ESP-IDF submodules and components
+esp-idf/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+.env
+
+# Other
+esp-idf/
+.uploads/
+*.log
+.trae/
+docs/

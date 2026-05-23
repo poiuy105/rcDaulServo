@@ -1,0 +1,38 @@
+name: Build ESP32C3 Projects
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IDF_VERSION: v5.4.4
+  TARGET_CHIP: esp32c3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project:
+          - {name: gatt_client, path: ./gatt_client, bin_name: gatt_client_demo}
+          - {name: gatt_server, path: ./gatt_server, bin_name: gatt_server_demos}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build and Merge BIN
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v5.4.4
+        target: esp32c3
+        path: ${{ matrix.project.path }}
+        command: >
+          bash -c "idf.py build &&
+          esptool.py --chip esp32c3 merge_bin
+          -o build/${{ matrix.project.name }}_merged.bin
+          --flash_mode dio --flash_freq 80m --flash_size 4MB
+          0x0 build/bootloader/bootloader.bin
+          0x8000 build/partition_table/partition-table.bin
+          0x10000 build/${{ matrix.project.bin_name }}.bin"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.project.name }}_merged.bin
+        path: ${{ matrix.project.path }}/build/${{ matrix.project.name }}_merged.bin
