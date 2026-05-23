@@ -28,8 +28,193 @@
 #include "owl_protocol.h"
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+#include "led_strip.h"
 
 #define GATTC_TAG "OWL_CLIENT"
+
+/*============================================================================
+ *                              WS2812 LED 配置
+ *============================================================================*/
+
+#define WS2812_GPIO         10
+#define WS2812_LED_NUM      4
+#define WS2812_BRIGHTNESS   50  // 0-255, 降低亮度避免刺眼
+
+// LED索引
+#define LED_CONN            0   // 连接状态
+#define LED_BATTERY         1   // 电池电量
+#define LED_KEY             2   // 按键反馈
+#define LED_COMM            3   // 通信状态
+
+// LED颜色定义 (RGB)
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} led_color_t;
+
+// 预定义颜色
+static const led_color_t COLOR_OFF     = {0, 0, 0};
+static const led_color_t COLOR_RED     = {255, 0, 0};
+static const led_color_t COLOR_GREEN   = {0, 255, 0};
+static const led_color_t COLOR_BLUE    = {0, 0, 255};
+static const led_color_t COLOR_YELLOW  = {255, 255, 0};
+static const led_color_t COLOR_ORANGE  = {255, 165, 0};
+static const led_color_t COLOR_PURPLE  = {255, 0, 255};
+static const led_color_t COLOR_CYAN    = {0, 255, 255};
+static const led_color_t COLOR_WHITE   = {255, 255, 255};
+static const led_color_t COLOR_PINK    = {255, 192, 203};
+
+// LED状态
+static led_color_t led_colors[WS2812_LED_NUM];
+static led_strip_handle_t led_strip = NULL;
+
+// 初始化WS2812
+static void ws2812_init(void) {
+    // RMT TX通道配置
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = WS2812_GPIO,
+        .max_leds = WS2812_LED_NUM,
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,  // 10MHz
+        .flags.with_dma = false,
+    };
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    
+    // 初始状态：全部关闭
+    for (int i = 0; i < WS2812_LED_NUM; i++) {
+        led_colors[i] = COLOR_OFF;
+    }
+    led_strip_clear(led_strip);
+    
+    ESP_LOGI(GATTC_TAG, "WS2812 LED初始化完成");
+    ESP_LOGI(GATTC_TAG, "  GPIO: %d, LED数量: %d", WS2812_GPIO, WS2812_LED_NUM);
+}
+
+// 设置单个LED颜色
+static void ws2812_set_led(int index, led_color_t color) {
+    if (index < 0 || index >= WS2812_LED_NUM) return;
+    
+    led_colors[index] = color;
+    led_strip_set_pixel(led_strip, index, 
+                        (color.g * WS2812_BRIGHTNESS) / 255,
+                        (color.r * WS2812_BRIGHTNESS) / 255,
+                        (color.b * WS2812_BRIGHTNESS) / 255);
+    led_strip_refresh(led_strip);
+}
+
+// 刷新所有LED
+static void ws2812_refresh(void) {
+    for (int i = 0; i < WS2812_LED_NUM; i++) {
+        led_strip_set_pixel(led_strip, i,
+                            (led_colors[i].g * WS2812_BRIGHTNESS) / 255,
+                            (led_colors[i].r * WS2812_BRIGHTNESS) / 255,
+                            (led_colors[i].b * WS2812_BRIGHTNESS) / 255);
+    }
+    led_strip_refresh(led_strip);
+}
+
+// 关闭所有LED
+static void ws2812_all_off(void) {
+    for (int i = 0; i < WS2812_LED_NUM; i++) {
+        led_colors[i] = COLOR_OFF;
+    }
+    led_strip_clear(led_strip);
+}
+
+// 启动动画（彩虹渐变）
+static void ws2812_startup_animation(void) {
+    led_color_t rainbow[] = {
+        {255, 0, 0},    // 红
+        {255, 127, 0},  // 橙
+        {255, 255, 0},  // 黄
+        {0, 255, 0},    // 绿
+        {0, 0, 255},    // 蓝
+        {75, 0, 130},   // 靛
+        {148, 0, 211},  // 紫
+    };
+    
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < WS2812_LED_NUM; j++) {
+                led_strip_set_pixel(led_strip, j,
+                                    (rainbow[i].g * WS2812_BRIGHTNESS) / 255,
+                                    (rainbow[i].r * WS2812_BRIGHTNESS) / 255,
+                                    (rainbow[i].b * WS2812_BRIGHTNESS) / 255);
+            }
+            led_strip_refresh(led_strip);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    led_strip_clear(led_strip);
+}
+
+// 配对成功动画
+static void ws2812_pairing_animation(void) {
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < WS2812_LED_NUM; j++) {
+            led_strip_set_pixel(led_strip, j,
+                                (COLOR_WHITE.g * WS2812_BRIGHTNESS) / 255,
+                                (COLOR_WHITE.r * WS2812_BRIGHTNESS) / 255,
+                                (COLOR_WHITE.b * WS2812_BRIGHTNESS) / 255);
+        }
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        led_strip_clear(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// LED状态更新函数
+static void ws2812_update_connection(bool connected) {
+    ws2812_set_led(LED_CONN, connected ? COLOR_GREEN : COLOR_RED);
+}
+
+static void ws2812_update_battery(uint8_t battery_percent) {
+    led_color_t color;
+    if (battery_percent > 80) {
+        color = COLOR_GREEN;
+    } else if (battery_percent > 50) {
+        color = COLOR_BLUE;
+    } else if (battery_percent > 20) {
+        color = COLOR_YELLOW;
+    } else {
+        color = COLOR_RED;
+    }
+    ws2812_set_led(LED_BATTERY, color);
+}
+
+static void ws2812_update_key(uint8_t switch1, uint8_t switch2, uint8_t joystick_btn) {
+    led_color_t color = COLOR_OFF;
+    
+    if (joystick_btn) {
+        color = COLOR_BLUE;
+    } else if (switch1 & OWL_SW_CENTER) {
+        color = COLOR_WHITE;
+    } else if (switch1 & OWL_SW_UP) {
+        color = COLOR_PURPLE;
+    } else if (switch1 & OWL_SW_DOWN) {
+        color = COLOR_CYAN;
+    } else if (switch1 & (OWL_SW_LEFT | OWL_SW_RIGHT)) {
+        color = COLOR_ORANGE;
+    } else if (switch2) {
+        color = COLOR_PINK;
+    }
+    
+    ws2812_set_led(LED_KEY, color);
+}
+
+static void ws2812_update_comm(bool sending) {
+    ws2812_set_led(LED_COMM, sending ? COLOR_CYAN : COLOR_GREEN);
+}
 
 /*============================================================================
  *                              摇杆 ADC 配置
@@ -464,17 +649,35 @@ static void send_test_data(void *arg) {
 // 按键扫描任务
 static void key_scan_task(void *arg) {
     uint8_t last_sw1 = 0, last_sw2 = 0;
+    uint8_t last_btn = 0;
     
     while (1) {
         if (connect && char_control_handle != INVALID_HANDLE) {
             uint8_t sw1, sw2;
             bool changed = matrix_key_scan(&sw1, &sw2);
             
+            // 读取摇杆按键状态
+            uint8_t x, y, btn;
+            joystick_read(&x, &y, &btn);
+            
+            // 更新按键LED状态
+            ws2812_update_key(sw1, sw2, btn);
+            
             // 按键变化时立即发送
             if (changed && (sw1 != last_sw1 || sw2 != last_sw2)) {
                 send_switch_data(sw1, sw2);
                 last_sw1 = sw1;
                 last_sw2 = sw2;
+                
+                // 通信LED闪烁
+                ws2812_update_comm(true);
+                vTaskDelay(pdMS_TO_TICKS(50));
+                ws2812_update_comm(false);
+            }
+            
+            // 摇杆按键变化
+            if (btn != last_btn) {
+                last_btn = btn;
             }
         }
         
@@ -627,6 +830,11 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
                 
+                // 更新LED状态：已连接
+                ws2812_update_connection(true);
+                ws2812_update_battery(70);  // 模拟电量70%
+                ws2812_pairing_animation();
+                
                 esp_timer_create_args_t timer_args = {
                     .callback = send_test_data,
                     .arg = NULL,
@@ -767,6 +975,10 @@ void app_main(void) {
 
     // 初始化矩阵按键
     matrix_key_init();
+
+    // 初始化WS2812 LED
+    ws2812_init();
+    ws2812_startup_animation();
 
     ESP_LOGI(GATTC_TAG, "猫头鹰 BLE 客户端初始化完成");
     ESP_LOGI(GATTC_TAG, "目标设备: %s", target_device_name);
