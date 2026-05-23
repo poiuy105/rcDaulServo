@@ -97,6 +97,117 @@ static void joystick_read(uint8_t *x, uint8_t *y, uint8_t *btn) {
 }
 
 /*============================================================================
+ *                              矩阵按键配置
+ *============================================================================*/
+
+// 行线（输出）
+#define MATRIX_ROW1_GPIO    2
+#define MATRIX_ROW2_GPIO    8
+static const int matrix_rows[] = {MATRIX_ROW1_GPIO, MATRIX_ROW2_GPIO};
+#define MATRIX_ROWS         2
+
+// 列线（输入，上拉）
+#define MATRIX_COL1_GPIO    6   // 上
+#define MATRIX_COL2_GPIO    5   // 下
+#define MATRIX_COL3_GPIO    7   // 左
+#define MATRIX_COL4_GPIO    1   // 右
+#define MATRIX_COL5_GPIO    0   // 中
+static const int matrix_cols[] = {MATRIX_COL1_GPIO, MATRIX_COL2_GPIO, MATRIX_COL3_GPIO, MATRIX_COL4_GPIO, MATRIX_COL5_GPIO};
+#define MATRIX_COLS         5
+
+// 按键状态
+static uint8_t matrix_key_state[MATRIX_ROWS][MATRIX_COLS] = {0};
+static uint8_t matrix_key_last_state[MATRIX_ROWS][MATRIX_COLS] = {0};
+
+// 初始化矩阵按键
+static void matrix_key_init(void) {
+    // 配置行线为输出
+    gpio_config_t row_conf = {
+        .pin_bit_mask = (1ULL << MATRIX_ROW1_GPIO) | (1ULL << MATRIX_ROW2_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&row_conf));
+    
+    // 配置列线为输入（上拉）
+    gpio_config_t col_conf = {
+        .pin_bit_mask = (1ULL << MATRIX_COL1_GPIO) | (1ULL << MATRIX_COL2_GPIO) |
+                        (1ULL << MATRIX_COL3_GPIO) | (1ULL << MATRIX_COL4_GPIO) |
+                        (1ULL << MATRIX_COL5_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&col_conf));
+    
+    // 初始化行线为高电平
+    gpio_set_level(MATRIX_ROW1_GPIO, 1);
+    gpio_set_level(MATRIX_ROW2_GPIO, 1);
+    
+    ESP_LOGI(GATTC_TAG, "矩阵按键初始化完成");
+    ESP_LOGI(GATTC_TAG, "  行线: GPIO%d, GPIO%d", MATRIX_ROW1_GPIO, MATRIX_ROW2_GPIO);
+    ESP_LOGI(GATTC_TAG, "  列线: GPIO%d, GPIO%d, GPIO%d, GPIO%d, GPIO%d",
+             MATRIX_COL1_GPIO, MATRIX_COL2_GPIO, MATRIX_COL3_GPIO, MATRIX_COL4_GPIO, MATRIX_COL5_GPIO);
+}
+
+// 扫描矩阵按键，返回是否有变化
+static bool matrix_key_scan(uint8_t *switch1, uint8_t *switch2) {
+    bool changed = false;
+    
+    // 保存上次状态
+    memcpy(matrix_key_last_state, matrix_key_state, sizeof(matrix_key_state));
+    
+    // 逐行扫描
+    for (int row = 0; row < MATRIX_ROWS; row++) {
+        // 当前行拉低
+        gpio_set_level(matrix_rows[row], 0);
+        
+        // 延时让电平稳定
+        esp_rom_delay_us(10);
+        
+        // 读取列线（按下为低电平）
+        for (int col = 0; col < MATRIX_COLS; col++) {
+            matrix_key_state[row][col] = (gpio_get_level(matrix_cols[col]) == 0) ? 1 : 0;
+        }
+        
+        // 当前行拉高
+        gpio_set_level(matrix_rows[row], 1);
+    }
+    
+    // 检查是否有变化
+    for (int row = 0; row < MATRIX_ROWS; row++) {
+        for (int col = 0; col < MATRIX_COLS; col++) {
+            if (matrix_key_state[row][col] != matrix_key_last_state[row][col]) {
+                changed = true;
+            }
+        }
+    }
+    
+    // 转换为switch1/switch2格式
+    // 行0 = 开关1，行1 = 开关2
+    // 列0=上, 列1=下, 列2=左, 列3=右, 列4=中
+    *switch1 = 0;
+    *switch2 = 0;
+    
+    if (matrix_key_state[0][0]) *switch1 |= OWL_SW_UP;
+    if (matrix_key_state[0][1]) *switch1 |= OWL_SW_DOWN;
+    if (matrix_key_state[0][2]) *switch1 |= OWL_SW_LEFT;
+    if (matrix_key_state[0][3]) *switch1 |= OWL_SW_RIGHT;
+    if (matrix_key_state[0][4]) *switch1 |= OWL_SW_CENTER;
+    
+    if (matrix_key_state[1][0]) *switch2 |= OWL_SW_UP;
+    if (matrix_key_state[1][1]) *switch2 |= OWL_SW_DOWN;
+    if (matrix_key_state[1][2]) *switch2 |= OWL_SW_LEFT;
+    if (matrix_key_state[1][3]) *switch2 |= OWL_SW_RIGHT;
+    if (matrix_key_state[1][4]) *switch2 |= OWL_SW_CENTER;
+    
+    return changed;
+}
+
+/*============================================================================
  *                              GATT 定义
  *============================================================================*/
 
@@ -120,8 +231,10 @@ static char target_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = OWL_DEVICE_NAME;
 static bool connect = false;
 static bool get_server = false;
 
-// 序列号
-static uint8_t seq_num = 0;
+// 序列号（各包类型独立，避免服务器端丢包误报）
+static uint8_t seq_joystick = 0;
+static uint8_t seq_heartbeat = 0;
+static uint8_t seq_switch = 0;
 
 // 特征值句柄
 static uint16_t char_control_handle = INVALID_HANDLE;
@@ -244,13 +357,9 @@ static struct gattc_profile_inst gl_profile = {
  *                              数据包构建函数
  *============================================================================*/
 
-static uint8_t get_next_seq(void) {
-    return seq_num++;
-}
-
 static void build_joystick_packet(owl_joystick_pkt_t *pkt, uint8_t x, uint8_t y, uint8_t btn) {
     pkt->header.version_type = OWL_MAKE_HEADER(OWL_PKT_JOYSTICK);
-    pkt->header.seq = get_next_seq();
+    pkt->header.seq = seq_joystick++;
     pkt->header.timestamp = (uint8_t)(esp_timer_get_time() / 1000);
     pkt->x_axis = x;
     pkt->y_axis = y;
@@ -259,7 +368,7 @@ static void build_joystick_packet(owl_joystick_pkt_t *pkt, uint8_t x, uint8_t y,
 
 static void build_switch_packet(owl_switch_pkt_t *pkt, uint8_t sw1, uint8_t sw2) {
     pkt->header.version_type = OWL_MAKE_HEADER(OWL_PKT_SWITCH);
-    pkt->header.seq = get_next_seq();
+    pkt->header.seq = seq_switch++;
     pkt->header.timestamp = (uint8_t)(esp_timer_get_time() / 1000);
     pkt->switch1 = sw1;
     pkt->switch2 = sw2;
@@ -268,7 +377,7 @@ static void build_switch_packet(owl_switch_pkt_t *pkt, uint8_t sw1, uint8_t sw2)
 
 static void build_heartbeat_packet(owl_heartbeat_pkt_t *pkt, uint8_t status, uint8_t battery) {
     pkt->header.version_type = OWL_MAKE_HEADER(OWL_PKT_HEARTBEAT);
-    pkt->header.seq = get_next_seq();
+    pkt->header.seq = seq_heartbeat++;
     pkt->header.timestamp = (uint8_t)(esp_timer_get_time() / 1000);
     pkt->status = status;
     pkt->battery = battery;
@@ -276,7 +385,7 @@ static void build_heartbeat_packet(owl_heartbeat_pkt_t *pkt, uint8_t status, uin
 
 static void build_command_packet(owl_command_pkt_t *pkt, uint8_t cmd, uint8_t param, uint8_t need_ack) {
     pkt->header.version_type = OWL_MAKE_HEADER(OWL_PKT_COMMAND);
-    pkt->header.seq = get_next_seq();
+    pkt->header.seq = seq_switch++;  // 复用switch序列号
     pkt->header.timestamp = (uint8_t)(esp_timer_get_time() / 1000);
     pkt->cmd = cmd;
     pkt->param = param;
@@ -284,14 +393,10 @@ static void build_command_packet(owl_command_pkt_t *pkt, uint8_t cmd, uint8_t pa
 }
 
 /*============================================================================
- *                              测试数据发送
+ *                              数据发送函数
  *============================================================================*/
 
-static void send_joystick_data(void *arg) {
-    if (!connect || char_control_handle == INVALID_HANDLE) {
-        return;
-    }
-    
+static void send_joystick_data(void) {
     // 读取真实摇杆值
     uint8_t x, y, btn;
     joystick_read(&x, &y, &btn);
@@ -308,6 +413,31 @@ static void send_joystick_data(void *arg) {
                              ESP_GATT_AUTH_REQ_NONE);
 }
 
+static void send_switch_data(uint8_t sw1, uint8_t sw2) {
+    owl_switch_pkt_t pkt;
+    build_switch_packet(&pkt, sw1, sw2);
+    ESP_LOGI(GATTC_TAG, ">>> 发送 SWITCH 包 (矩阵按键)");
+    ESP_LOGI(GATTC_TAG, "    开关1=0x%02X, 开关2=0x%02X", pkt.switch1, pkt.switch2);
+    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
+                             char_control_handle,
+                             sizeof(pkt), (uint8_t*)&pkt,
+                             ESP_GATT_WRITE_TYPE_NO_RSP,
+                             ESP_GATT_AUTH_REQ_NONE);
+}
+
+static void send_heartbeat_data(void) {
+    owl_heartbeat_pkt_t pkt;
+    build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
+    ESP_LOGI(GATTC_TAG, ">>> 发送 HEARTBEAT 包");
+    ESP_LOGI(GATTC_TAG, "    状态=0x%02X, 电池=%d.%dV", pkt.status, pkt.battery/10, pkt.battery%10);
+    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
+                             char_control_handle,
+                             sizeof(pkt), (uint8_t*)&pkt,
+                             ESP_GATT_WRITE_TYPE_NO_RSP,
+                             ESP_GATT_AUTH_REQ_NONE);
+}
+
+// 定时器回调：发送摇杆和心跳数据
 static void send_test_data(void *arg) {
     if (!connect || char_control_handle == INVALID_HANDLE) {
         return;
@@ -318,25 +448,39 @@ static void send_test_data(void *arg) {
     switch (test_phase % 2) {
         case 0: {
             // 发送真实摇杆数据
-            send_joystick_data(arg);
+            send_joystick_data();
             break;
         }
         case 1: {
             // 发送心跳数据
-            owl_heartbeat_pkt_t pkt;
-            build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
-            ESP_LOGI(GATTC_TAG, ">>> 发送 HEARTBEAT 包");
-            ESP_LOGI(GATTC_TAG, "    状态=0x%02X, 电池=%d.%dV", pkt.status, pkt.battery/10, pkt.battery%10);
-            esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                                     char_control_handle,
-                                     sizeof(pkt), (uint8_t*)&pkt,
-                                     ESP_GATT_WRITE_TYPE_NO_RSP,
-                                     ESP_GATT_AUTH_REQ_NONE);
+            send_heartbeat_data();
             break;
         }
     }
     
     test_phase++;
+}
+
+// 按键扫描任务
+static void key_scan_task(void *arg) {
+    uint8_t last_sw1 = 0, last_sw2 = 0;
+    
+    while (1) {
+        if (connect && char_control_handle != INVALID_HANDLE) {
+            uint8_t sw1, sw2;
+            bool changed = matrix_key_scan(&sw1, &sw2);
+            
+            // 按键变化时立即发送
+            if (changed && (sw1 != last_sw1 || sw2 != last_sw2)) {
+                send_switch_data(sw1, sw2);
+                last_sw1 = sw1;
+                last_sw2 = sw2;
+            }
+        }
+        
+        // 10ms扫描一次
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 /*============================================================================
@@ -478,7 +622,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 }
             }
             
-            // 启动测试定时器
+            // 启动测试定时器和按键扫描任务
             if (char_control_handle != INVALID_HANDLE) {
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
@@ -490,6 +634,13 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 };
                 esp_timer_create(&timer_args, &test_timer);
                 esp_timer_start_periodic(test_timer, 500000);  // 每 500ms 发送一次
+                
+                // 启动按键扫描任务（只启动一次）
+                static bool key_task_started = false;
+                if (!key_task_started) {
+                    xTaskCreate(key_scan_task, "key_scan", 2048, NULL, 5, NULL);
+                    key_task_started = true;
+                }
             }
         }
         break;
@@ -499,7 +650,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         connect = false;
         get_server = false;
         char_control_handle = INVALID_HANDLE;
-        seq_num = 0;
+        // 重置各序列号
+        seq_joystick = 0;
+        seq_heartbeat = 0;
+        seq_switch = 0;
         
         if (test_timer != NULL) {
             esp_timer_stop(test_timer);
@@ -610,6 +764,9 @@ void app_main(void) {
 
     // 初始化摇杆ADC
     joystick_adc_init();
+
+    // 初始化矩阵按键
+    matrix_key_init();
 
     ESP_LOGI(GATTC_TAG, "猫头鹰 BLE 客户端初始化完成");
     ESP_LOGI(GATTC_TAG, "目标设备: %s", target_device_name);
