@@ -61,6 +61,47 @@ static uint8_t servo_x_angle = 90;
 static uint8_t servo_y_angle = 90;
 
 /*============================================================================
+ *                              继电器 GPIO 配置
+ *============================================================================*/
+
+// 继电器 GPIO 定义
+#define RELAY_LIGHT_GPIO    10   // 灯光（眼睛）
+#define RELAY_SOUND_GPIO    7    // 声音（躯干）
+#define RELAY_CANNON_GPIO   8    // 开炮（嘴巴）
+
+// 继电器状态
+static bool relay_light_on = false;
+static bool relay_sound_on = false;
+static bool relay_cannon_on = false;
+
+// 初始化继电器 GPIO
+static void relay_init(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RELAY_LIGHT_GPIO) | (1ULL << RELAY_SOUND_GPIO) | (1ULL << RELAY_CANNON_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    
+    // 初始状态：全部关闭（低电平）
+    gpio_set_level(RELAY_LIGHT_GPIO, 0);
+    gpio_set_level(RELAY_SOUND_GPIO, 0);
+    gpio_set_level(RELAY_CANNON_GPIO, 0);
+    
+    ESP_LOGI(GATTS_TAG, "继电器 GPIO 初始化完成");
+    ESP_LOGI(GATTS_TAG, "  灯光: GPIO%d", RELAY_LIGHT_GPIO);
+    ESP_LOGI(GATTS_TAG, "  声音: GPIO%d", RELAY_SOUND_GPIO);
+    ESP_LOGI(GATTS_TAG, "  开炮: GPIO%d", RELAY_CANNON_GPIO);
+}
+
+// 设置继电器状态
+static void relay_set(uint32_t gpio_num, bool on) {
+    gpio_set_level(gpio_num, on ? 1 : 0);
+}
+
+/*============================================================================
  *                              GATT 定义
  *============================================================================*/
 
@@ -358,6 +399,36 @@ static void parse_switch_packet(owl_switch_pkt_t *pkt) {
              (pkt->switch2 & OWL_SW_LEFT) ? 1 : 0,
              (pkt->switch2 & OWL_SW_RIGHT) ? 1 : 0,
              (pkt->switch2 & OWL_SW_CENTER) ? 1 : 0);
+    
+    // 继电器控制映射
+    // 开关1-中 (0x10) -> 灯光 (IO10)
+    // 开关1-上 (0x01) -> 声音 (IO7)
+    // 开关1-下 (0x02) -> 开炮 (IO8)
+    
+    bool light_on = (pkt->switch1 & OWL_SW_CENTER) != 0;
+    bool sound_on = (pkt->switch1 & OWL_SW_UP) != 0;
+    bool cannon_on = (pkt->switch1 & OWL_SW_DOWN) != 0;
+    
+    // 更新灯光继电器
+    if (light_on != relay_light_on) {
+        relay_light_on = light_on;
+        relay_set(RELAY_LIGHT_GPIO, relay_light_on);
+        ESP_LOGI(GATTS_TAG, "  → 灯光继电器: %s", relay_light_on ? "开" : "关");
+    }
+    
+    // 更新声音继电器
+    if (sound_on != relay_sound_on) {
+        relay_sound_on = sound_on;
+        relay_set(RELAY_SOUND_GPIO, relay_sound_on);
+        ESP_LOGI(GATTS_TAG, "  → 声音继电器: %s", relay_sound_on ? "开" : "关");
+    }
+    
+    // 更新开炮继电器
+    if (cannon_on != relay_cannon_on) {
+        relay_cannon_on = cannon_on;
+        relay_set(RELAY_CANNON_GPIO, relay_cannon_on);
+        ESP_LOGI(GATTS_TAG, "  → 开炮继电器: %s", relay_cannon_on ? "开" : "关");
+    }
 }
 
 static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
@@ -718,6 +789,9 @@ void app_main(void) {
 
     // 初始化舵机
     servo_init();
+
+    // 初始化继电器
+    relay_init();
 
     ESP_LOGI(GATTS_TAG, "猫头鹰 BLE 服务端初始化完成");
     ESP_LOGI(GATTS_TAG, "设备名: %s", OWL_DEVICE_NAME);
