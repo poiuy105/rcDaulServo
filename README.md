@@ -1,39 +1,173 @@
-# RC Dual Servos - ESP32C3 BLE Master/Slave Framework
+# BLE猫头鹰玩具 - ESP32C3 遥控系统
 
-猫头鹰哨兵 ESP-IDF BLE 通讯框架项目，包含master和slave两个ESP32C3项目。
+基于ESP-IDF的BLE遥控系统，包含遥控器端（gatt_client）和猫头鹰端（gatt_server）两个ESP32C3项目。
 
 ## 项目结构
 
-- **master/**: BLE客户端项目，主动扫描并连接到slave设备
-- **slave/**: BLE服务器项目，广播并等待master连接
+```
+rcDaulServo/
+├── gatt_client/          # 遥控器端 - BLE客户端
+│   ├── main/
+│   │   └── gattc_demo.c  # 主程序
+│   └── CMakeLists.txt
+├── gatt_server/          # 猫头鹰端 - BLE服务器
+│   ├── main/
+│   │   └── gatts_demo.c  # 主程序
+│   └── CMakeLists.txt
+├── protocol/
+│   └── owl_protocol.h    # 通信协议定义
+└── .github/workflows/
+    └── build.yml         # GitHub Actions CI/CD
+```
+
+## 硬件配置
+
+### 遥控器端 (COM6)
+| GPIO | 功能 | 说明 |
+|------|------|------|
+| IO3 | 摇杆X轴 | ADC输入 |
+| IO4 | 摇杆Y轴 | ADC输入 |
+| IO9 | 摇杆按键 | GPIO输入（按下低电平）|
+| IO10 | WS2812灯带 | 4个LED状态指示 |
+| IO2/IO8 | 矩阵行线 | 2个5向开关扫描 |
+| IO6/5/7/1/0 | 矩阵列线 | 上/下/左/右/中 |
+
+### 猫头鹰端 (COM5)
+| GPIO | 功能 | 说明 |
+|------|------|------|
+| IO3 | 舵机X | 左右转身（MG996R）|
+| IO4 | 舵机Y | 头部俯仰（MG996R）|
+| IO10 | 灯光继电器 | 眼睛灯光 |
+| IO7 | 声音继电器 | 躯干声音 |
+| IO8 | 开炮继电器 | 嘴巴开炮 |
 
 ## 功能特性
 
-- ESP32C3 BLE通信
-- GitHub Actions自动编译
-- 自动生成merged.bin固件文件
+### BLE通信协议
+- **服务UUID**: `0x1815` (Automation IO)
+- **控制通道**: `0x2A52` (Write Without Response)
+- **反馈通道**: `0x2A56` (Notify)
+- **命令通道**: `0x2A3D` (Write + Indicate)
 
-## 编译
+### 数据包类型
+| 类型 | 值 | 说明 |
+|------|-----|------|
+| JOYSTICK | 0x11 | 摇杆数据 (X, Y, 按键) |
+| SWITCH | 0x12 | 开关数据 (开关1, 开关2) |
+| HEARTBEAT | 0x13 | 心跳包 (状态, 电池) |
+| COMMAND | 0x14 | 命令包 (命令码, 参数) |
+| STATUS | 0x15 | 状态反馈 |
+| SENSOR | 0x16 | 传感器数据 |
+| ERROR | 0x1F | 错误报告 |
 
-项目配置了GitHub Actions CI/CD，每次推送到main分支时会自动编译。
+### 核心功能
 
-也可以本地编译：
+#### 1. 舵机控制
+- 摇杆X轴(0-255) → 舵机X角度(0-180°)
+- 摇杆Y轴(0-255) → 舵机Y角度(0-180°)
+- MG996R舵机，PWM 50Hz，脉宽0.5ms-2.5ms
+
+#### 2. 矩阵按键扫描
+- 2×5矩阵扫描，10个按键
+- 开关1: 上/下/左/右/中 → 声音/开炮/预留/预留/灯光
+- 开关2: 上/下/左/右/中 → 预留
+- 10ms扫描周期，按键变化即时发送
+
+#### 3. 继电器控制
+| 按键 | 继电器 | 功能 |
+|------|--------|------|
+| 开关1-中 | IO10 | 眼睛灯光 |
+| 开关1-上 | IO7 | 躯干声音 |
+| 开关1-下 | IO8 | 嘴巴开炮 |
+
+#### 4. WS2812状态指示
+| LED | 功能 | 状态 |
+|-----|------|------|
+| LED0 | 连接状态 | 绿=已连接, 红=未连接 |
+| LED1 | 电池电量 | 绿>80%, 蓝>50%, 黄>20%, 红<20% |
+| LED2 | 按键反馈 | 不同颜色对应不同按键 |
+| LED3 | 通信状态 | 青=发送中, 绿=空闲 |
+
+#### 5. MAC地址绑定
+- 首次连接自动绑定
+- NVS持久化存储
+- 非绑定设备自动拒绝
+
+#### 6. 心跳与断线重连
+- 客户端: 3秒心跳超时检测
+- 服务端: 5秒心跳超时检测
+- 断线后自动扫描重连
+- LED状态实时反馈
+
+## 编译与烧录
+
+### GitHub Actions自动编译
+每次推送到main分支自动编译，生成合并固件：
+- `gatt_client_merged.bin`
+- `gatt_server_merged.bin`
+
+### 本地编译
 ```bash
-cd master
+# 编译遥控器端
+cd gatt_client
 idf.py set-target esp32c3
 idf.py build
 
-cd ../slave
+# 编译猫头鹰端
+cd ../gatt_server
 idf.py set-target esp32c3
 idf.py build
 ```
 
-## 烧录
-
+### 烧录固件
 ```bash
-# 烧录 master
-esptool.py --chip esp32c3 write_flash 0x0 master/build/master_merged.bin
+# 烧录遥控器端 (COM6)
+esptool.py --chip esp32c3 --port COM6 write_flash 0x0 gatt_client_merged.bin
 
-# 烧录 slave
-esptool.py --chip esp32c3 write_flash 0x0 slave/build/slave_merged.bin
+# 烧录猫头鹰端 (COM5)
+esptool.py --chip esp32c3 --port COM5 write_flash 0x0 gatt_server_merged.bin
 ```
+
+## 使用说明
+
+### 首次配对
+1. 上电猫头鹰端，进入广播状态
+2. 上电遥控器端，自动扫描并连接
+3. 首次连接自动完成MAC绑定
+4. LED0变绿色表示连接成功
+
+### 正常操作
+- **摇杆**: 控制猫头鹰头部转动
+- **开关1-中**: 眼睛灯光开关
+- **开关1-上**: 声音触发
+- **开关1-下**: 开炮动作
+- **LED灯带**: 实时显示系统状态
+
+### 断线重连
+- 通信异常时LED0变红色
+- 自动扫描并重连
+- 重连成功后恢复绿色
+
+## 开发历史
+
+| 日期 | 版本 | 功能 |
+|------|------|------|
+| 2025-05-23 | v1.0 | 初始版本，基础BLE通信 |
+| 2025-05-23 | v1.1 | 添加舵机控制 |
+| 2025-05-23 | v1.2 | 添加矩阵按键扫描 |
+| 2025-05-23 | v1.3 | 添加继电器控制 |
+| 2025-05-23 | v1.4 | 添加WS2812状态指示 |
+| 2025-05-23 | v1.5 | 添加心跳检测与自动重连 |
+
+## 技术栈
+
+- **ESP-IDF v5.4.4**: ESP32开发框架
+- **BLE 5.0**: 低功耗蓝牙通信
+- **LEDC**: 舵机PWM控制
+- **ADC**: 摇杆模拟输入
+- **RMT**: WS2812驱动
+- **NVS**: 非易失性存储
+
+## 许可证
+
+MIT License
