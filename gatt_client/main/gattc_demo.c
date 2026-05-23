@@ -105,8 +105,8 @@ static void ws2812_set_led(int index, led_color_t color) {
     
     led_colors[index] = color;
     led_strip_set_pixel(led_strip, index, 
-                        (color.g * WS2812_BRIGHTNESS) / 255,
                         (color.r * WS2812_BRIGHTNESS) / 255,
+                        (color.g * WS2812_BRIGHTNESS) / 255,
                         (color.b * WS2812_BRIGHTNESS) / 255);
     led_strip_refresh(led_strip);
 }
@@ -115,8 +115,8 @@ static void ws2812_set_led(int index, led_color_t color) {
 static void ws2812_refresh(void) {
     for (int i = 0; i < WS2812_LED_NUM; i++) {
         led_strip_set_pixel(led_strip, i,
-                            (led_colors[i].g * WS2812_BRIGHTNESS) / 255,
                             (led_colors[i].r * WS2812_BRIGHTNESS) / 255,
+                            (led_colors[i].g * WS2812_BRIGHTNESS) / 255,
                             (led_colors[i].b * WS2812_BRIGHTNESS) / 255);
     }
     led_strip_refresh(led_strip);
@@ -146,8 +146,8 @@ static void ws2812_startup_animation(void) {
         for (int i = 0; i < 7; i++) {
             for (int j = 0; j < WS2812_LED_NUM; j++) {
                 led_strip_set_pixel(led_strip, j,
-                                    (rainbow[i].g * WS2812_BRIGHTNESS) / 255,
                                     (rainbow[i].r * WS2812_BRIGHTNESS) / 255,
+                                    (rainbow[i].g * WS2812_BRIGHTNESS) / 255,
                                     (rainbow[i].b * WS2812_BRIGHTNESS) / 255);
             }
             led_strip_refresh(led_strip);
@@ -162,8 +162,8 @@ static void ws2812_pairing_animation(void) {
     for (int i = 0; i < 3; i++) {
         for (int j = 0; j < WS2812_LED_NUM; j++) {
             led_strip_set_pixel(led_strip, j,
-                                (COLOR_WHITE.g * WS2812_BRIGHTNESS) / 255,
                                 (COLOR_WHITE.r * WS2812_BRIGHTNESS) / 255,
+                                (COLOR_WHITE.g * WS2812_BRIGHTNESS) / 255,
                                 (COLOR_WHITE.b * WS2812_BRIGHTNESS) / 255);
         }
         led_strip_refresh(led_strip);
