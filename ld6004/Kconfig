@@ -1,0 +1,23 @@
+menu "LD6004 Radar Configuration"
+
+    config RADAR_UART_TX_PIN
+        int "Radar UART TX Pin"
+        default 1
+        range 0 21
+        help
+            TX pin connected to LD6004 RX
+
+    config RADAR_UART_RX_PIN
+        int "Radar UART RX Pin"
+        default 0
+        range 0 21
+        help
+            RX pin connected to LD6004 TX
+
+    config RADAR_UART_BAUD
+        int "Radar UART Baud Rate"
+        default 115200
+        help
+            UART baud rate for LD6004 (default 115200)
+
+endmenu

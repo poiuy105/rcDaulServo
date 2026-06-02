@@ -61,6 +61,7 @@ extern "C" {
 #define OWL_PKT_EVENT               0x82    // 事件通知
 #define OWL_PKT_ACK                 0x83    // 命令确认
 #define OWL_PKT_ERROR               0x84    // 错误报告
+#define OWL_PKT_TYPE_RADAR_STATUS   0x18    // 雷达状态上报
 
 /*============================================================================
  *                              命令码定义
@@ -237,6 +238,24 @@ typedef struct __attribute__((packed)) {
 #define OWL_PKT_STATUS_SIZE     sizeof(owl_status_pkt_t)
 #define OWL_PKT_EVENT_SIZE      sizeof(owl_event_pkt_t)
 #define OWL_PKT_ACK_SIZE        sizeof(owl_ack_pkt_t)
+
+/*============================================================================
+ *                              雷达状态包定义
+ *============================================================================*/
+
+/**
+ * @brief 雷达状态数据包 (类型 0x18)
+ * @note 总长度: 11 bytes
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t header[3];      // version_type=0x18, seq, timestamp
+    uint8_t target_count;   // 目标数量 (0-3)
+    int16_t x;              // X 坐标 (cm, LE)
+    int16_t y;              // Y 坐标 (cm, LE)
+    int16_t z;              // Z 坐标 (cm, LE)
+} radar_status_packet_t;
+
+#define OWL_PKT_RADAR_STATUS_SIZE   sizeof(radar_status_packet_t)
 
 #ifdef __cplusplus
 }

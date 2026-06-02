@@ -1,0 +1,8 @@
+version: "1.0.0"
+description: HLK-LD6004 mmWave Radar Driver
+url: https://github.com/poiuy105/rcDaulServo
+maintainer: poiuy105
+dependencies:
+  esp_driver_uart: "^1.0"
+  esp_timer: "^1.0"
+  esp_event: "^3.0"
