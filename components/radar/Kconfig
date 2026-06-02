@@ -1,0 +1,85 @@
+menu "Radar Configuration"
+
+    choice RADAR_TYPE
+        prompt "Select radar type"
+        default RADAR_LD2460
+
+        config RADAR_LD2450
+            bool "HLK-LD2450 (1T2R Multi-target Tracking)"
+            help
+                Hi-Link LD2450 24GHz millimeter wave radar.
+                Binary protocol, default baud rate 256000.
+                Supports X/Y coordinates, speed, resolution per target.
+
+        config RADAR_LD2460
+            bool "HLK-LD2460 (2T4R Multi-target Tracking)"
+            help
+                Hi-Link LD2460 24GHz millimeter wave radar.
+                Binary protocol, default baud rate 115200.
+
+        config RADAR_LD6004
+            bool "HLK-LD6004 (3D Presence Detection)"
+            help
+                Hi-Link LD6004 60GHz 3D presence radar.
+                TinyFrame protocol, default baud rate 115200.
+                Supports X/Y/Z coordinates, area detection, low power mode.
+
+        config RADAR_LD6002B
+            bool "HLK-LD6002B (3D Presence Detection)"
+            help
+                Hi-Link LD6002B 60GHz 3D presence radar.
+                TinyFrame protocol, default baud rate 115200.
+                Supports X/Y/Z coordinates, area detection, low power mode.
+                Subset of LD6004 features (no stay areas, no baud rate setting).
+
+        config RADAR_LD2461
+            bool "HLK-LD2461 (2T4R Motion Detection)"
+            help
+                Hi-Link LD2461 24GHz motion detection and tracking radar.
+                Binary protocol with big-endian format, default baud rate 9600.
+                Supports up to 3 configurable regions for filtering.
+
+        config RADAR_LD2452
+            bool "HLK-LD2452 (1T2R Multi-target Tracking)"
+            help
+                Hi-Link LD2452 24GHz high-precision multi-target sensor.
+                Report-only protocol (no commands), default baud rate 9600.
+                Fixed 30-byte frame: AA FF 03 00 [3 targets × 8 bytes] 55 CC.
+                Supports up to 3 targets with X/Y/speed/distance per target.
+
+        config RADAR_R60ABD1
+            bool "R60ABD1 (60GHz Sleep/Breath/Heart Rate Monitor)"
+            help
+                R60ABD1 60GHz millimeter wave sleep monitoring radar.
+                Custom protocol with frame header 0x53 0x59, tail 0x54 0x43.
+                Default baud rate 115200.
+                Supports breath rate, heart rate, sleep quality, bed in/out detection.
+
+    endchoice
+
+    config RADAR_UART_NUM
+        int "UART port number"
+        default 1
+        range 0 2
+
+    config RADAR_UART_TX_PIN
+        int "UART TX pin"
+        default 1
+
+    config RADAR_UART_RX_PIN
+        int "UART RX pin"
+        default 0
+
+    config RADAR_UART_BAUD_RATE
+        int "UART baud rate (0 = use radar default)"
+        default 0
+
+    config RADAR_TASK_STACK_SIZE
+        int "Radar parser task stack size"
+        default 4096
+
+    config RADAR_TASK_PRIORITY
+        int "Radar parser task priority"
+        default 10
+
+endmenu
