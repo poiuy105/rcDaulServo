@@ -28,7 +28,7 @@
 #include "owl_protocol.h"
 #include "driver/ledc.h"
 #include "esp_timer.h"
-#include "ld6004/radar_ld6004.h"
+#include "radar.h"
 
 #define GATTS_TAG "OWL_SERVER"
 
@@ -39,6 +39,11 @@
 static int64_t last_heartbeat_time = 0;
 static esp_gatt_if_t gatts_if_global = 0;
 static uint16_t conn_id_global = 0;
+
+// LD6004 Radar State
+static radar_handle_t radar_handle = NULL;
+static bool radar_enabled = false;
+static uint8_t radar_notify_seq = 0;
 
 /*============================================================================
  *                              舵机 PWM 配置
@@ -83,10 +88,6 @@ static uint8_t servo_y_angle = 90;
 static bool relay_light_on = false;
 static bool relay_sound_on = false;
 static bool relay_cannon_on = false;
-
-// LD6004 Radar State
-static bool radar_enabled = false;
-static uint8_t radar_seq = 0;
 
 // 初始化继电器 GPIO
 static void relay_init(void) {
@@ -380,12 +381,75 @@ static void servo_set_angle(uint8_t channel, uint8_t angle) {
     ledc_update_duty(LEDC_MODE, channel);
 }
 
+/*============================================================================
+ *                              LD6004 雷达功能
+ *============================================================================*/
+
 // 雷达坐标到舵机角度映射
-static uint16_t radar_servo_angle_from_coord(float coord, float gain) {
+static uint16_t radar_coord_to_angle(float coord, float gain) {
     int angle = 90 + (int)(coord * gain);
     if (angle < 0) angle = 0;
     if (angle > 180) angle = 180;
     return (uint16_t)angle;
+}
+
+// BLE 上报雷达状态
+static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_t z) {
+    if (gl_profile.conn_id == 0 || !radar_enabled) {
+        return;
+    }
+
+    uint8_t pkt[11];
+    pkt[0] = OWL_PROTOCOL_VERSION | 0x18;  // version_type: 雷达状态
+    pkt[1] = radar_notify_seq++;
+    pkt[2] = (uint8_t)(esp_log_timestamp() & 0xFF);
+    pkt[3] = target_count;
+    memcpy(&pkt[4], &x, 2);  // x (LE)
+    memcpy(&pkt[6], &y, 2);  // y (LE)
+    memcpy(&pkt[8], &z, 2);  // z (LE)
+
+    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+                                 gl_profile.conn_id,
+                                 gl_profile.descr_feedback_handle,
+                                 sizeof(pkt), pkt, false);
+}
+
+// 雷达事件处理器
+static void radar_event_handler(void *arg, esp_event_base_t event_base,
+                                  int32_t event_id, void *event_data) {
+    if (event_id != RADAR_EVENT_TARGET) {
+        return;
+    }
+
+    radar_data_t *data = (radar_data_t *)event_data;
+
+    if (data->target_count > 0) {
+        // 有目标: 舵机跟踪
+        ld6004_target_t *target = &data->targets[0];
+
+        uint16_t angle_x = radar_coord_to_angle(target->x, 45.0f);
+        uint16_t angle_y = radar_coord_to_angle(target->y, 45.0f);
+
+        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)angle_x);
+        servo_set_angle(LEDC_Y_CHANNEL, (uint8_t)angle_y);
+
+        ESP_LOGI(GATTS_TAG, "Radar target: x=%.2f y=%.2f z=%.2f -> servo: %d %d",
+                 target->x, target->y, target->z, angle_x, angle_y);
+
+        // BLE 上报 (坐标转换为厘米)
+        send_radar_notify(data->target_count,
+                         (int16_t)(target->x * 100),
+                         (int16_t)(target->y * 100),
+                         (int16_t)(target->z * 100));
+    } else {
+        // 无目标: 舵机回中点
+        servo_set_angle(LEDC_X_CHANNEL, 90);
+        servo_set_angle(LEDC_Y_CHANNEL, 90);
+
+        ESP_LOGI(GATTS_TAG, "Radar: no target, servo return to center");
+
+        send_radar_notify(0, 0, 0, 0);
+    }
 }
 
 // JOYSTICK值(0-255)映射到角度(0-180)
@@ -765,65 +829,6 @@ static void gatts_event_handler(esp_gatts_cb_event_t event,
 }
 
 /*============================================================================
- *                              雷达事件处理
- *============================================================================*/
-
-static void send_radar_status_notify(uint8_t target_count, int16_t x, int16_t y, int16_t z) {
-    if (gl_profile.conn_id == 0xFFFF || !radar_enabled) {
-        return;
-    }
-
-    radar_status_packet_t pkt;
-    pkt.header[0] = OWL_MAKE_HEADER(OWL_PKT_TYPE_RADAR_STATUS);
-    pkt.header[1] = radar_seq++;
-    pkt.header[2] = (uint8_t)(esp_log_timestamp() & 0xFF);
-    pkt.target_count = target_count;
-    pkt.x = x;
-    pkt.y = y;
-    pkt.z = z;
-
-    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
-                                 gl_profile.conn_id,
-                                 gl_profile.char_feedback_handle + 1,
-                                 sizeof(radar_status_packet_t), (uint8_t*)&pkt, false);
-}
-
-static void radar_event_handler(ld6004_event_data_t *event_data) {
-    if (event_data->type == LD6004_EVENT_TARGET_UPDATE) {
-        ld6004_target_data_t *target_data = &event_data->data.target;
-
-        if (target_data->target_count > 0) {
-            // 有目标: 舵机跟踪
-            ld6004_target_t *main_target = &target_data->targets[0];
-
-            uint16_t angle_x = radar_servo_angle_from_coord(main_target->x, 45.0f);
-            uint16_t angle_y = radar_servo_angle_from_coord(main_target->y, 45.0f);
-
-            // 更新舵机角度
-            servo_set_angle(LEDC_X_CHANNEL, (uint8_t)angle_x);
-            servo_set_angle(LEDC_Y_CHANNEL, (uint8_t)angle_y);
-
-            ESP_LOGI(GATTS_TAG, "Radar target: x=%.2f, y=%.2f, z=%.2f -> angles: %d, %d",
-                     main_target->x, main_target->y, main_target->z, angle_x, angle_y);
-
-            // BLE 上报雷达状态
-            send_radar_status_notify(target_data->target_count,
-                                     (int16_t)(main_target->x * 100),
-                                     (int16_t)(main_target->y * 100),
-                                     (int16_t)(main_target->z * 100));
-        } else {
-            // 无目标: 舵机回中点
-            servo_set_angle(LEDC_X_CHANNEL, 90);
-            servo_set_angle(LEDC_Y_CHANNEL, 90);
-            ESP_LOGI(GATTS_TAG, "Radar: no target, servo return to center");
-
-            // BLE 上报无目标状态
-            send_radar_status_notify(0, 0, 0, 0);
-        }
-    }
-}
-
-/*============================================================================
  *                              主函数
  *============================================================================*/
 
@@ -840,22 +845,6 @@ void app_main(void) {
 
     // 加载绑定信息
     load_bound_mac();
-
-    // Initialize LD6004 Radar
-    ld6004_config_t radar_config = LD6004_CONFIG_DEFAULT();
-    radar_config.uart_port = UART_NUM_1;
-    radar_config.tx_pin = CONFIG_RADAR_UART_TX_PIN;
-    radar_config.rx_pin = CONFIG_RADAR_UART_RX_PIN;
-
-    esp_err_t radar_ret = ld6004_init(&radar_config);
-    if (radar_ret == ESP_OK) {
-        ld6004_register_event_handler(radar_event_handler);
-        radar_enabled = true;
-        ESP_LOGI(GATTS_TAG, "LD6004 Radar initialized on TX=%d, RX=%d",
-                 CONFIG_RADAR_UART_TX_PIN, CONFIG_RADAR_UART_RX_PIN);
-    } else {
-        ESP_LOGW(GATTS_TAG, "LD6004 Radar init failed: %s", esp_err_to_name(radar_ret));
-    }
 
     // 释放经典蓝牙内存
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
@@ -912,6 +901,18 @@ void app_main(void) {
     ret = esp_ble_gatt_set_local_mtu(500);
     if (ret) {
         ESP_LOGE(GATTS_TAG, "设置 MTU 失败: %x", ret);
+    }
+
+    // 初始化 LD6004 雷达
+    radar_config_t radar_cfg = RADAR_CONFIG_DEFAULT();
+    radar_handle = RADAR_INIT(&radar_cfg);
+    if (radar_handle != NULL) {
+        RADAR_ADD_HANDLER(radar_handle, radar_event_handler, NULL);
+        radar_enabled = true;
+        ESP_LOGI(GATTS_TAG, "LD6004 Radar initialized (TX=GPIO%d, RX=GPIO%d)",
+                 CONFIG_RADAR_UART_TX_PIN, CONFIG_RADAR_UART_RX_PIN);
+    } else {
+        ESP_LOGW(GATTS_TAG, "LD6004 Radar init failed, continuing without radar");
     }
 
     // 初始化舵机
