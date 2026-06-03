@@ -34,18 +34,16 @@
 #define GATTC_TAG "OWL_CLIENT"
 
 // 心跳超时配置
-#define HEARTBEAT_TIMEOUT_MS    3000    // 3秒无心跳认为断线
+#define HEARTBEAT_TIMEOUT_MS    3000    // 3秒无接收认为断线
 #define RECONNECT_DELAY_MS      2000    // 断线后2秒开始重连
 
-// 心跳检测变量
-static int64_t last_heartbeat_time = 0;
-static bool heartbeat_timeout = false;
+// 心跳检测状态
+static volatile bool heartbeat_timeout = false;
 
 /*============================================================================
  *                              工作模式管理
  *============================================================================*/
 static owl_mode_t g_current_mode = OWL_MODE_REMOTE;
-static uint8_t g_combo_seq = 0;
 
 /*============================================================================
  *                              WS2812 LED 配置
@@ -344,6 +342,9 @@ static const int matrix_cols[] = {MATRIX_COL1_GPIO, MATRIX_COL2_GPIO, MATRIX_COL
 // 按键状态
 static uint8_t matrix_key_state[MATRIX_ROWS][MATRIX_COLS] = {0};
 static uint8_t matrix_key_last_state[MATRIX_ROWS][MATRIX_COLS] = {0};
+// 消抖计数器（连续读到相同值N次才认为有效）
+static uint8_t matrix_debounce_count[MATRIX_ROWS][MATRIX_COLS] = {0};
+#define DEBOUNCE_THRESHOLD  3  // 连续3次(30ms)相同才确认
 
 // 初始化矩阵按键
 static void matrix_key_init(void) {
@@ -379,42 +380,42 @@ static void matrix_key_init(void) {
              MATRIX_COL1_GPIO, MATRIX_COL2_GPIO, MATRIX_COL3_GPIO, MATRIX_COL4_GPIO, MATRIX_COL5_GPIO);
 }
 
-// 扫描矩阵按键，返回是否有变化
+// 扫描矩阵按键，返回是否有变化（含软件消抖）
 static bool matrix_key_scan(uint8_t *switch1, uint8_t *switch2) {
     bool changed = false;
+    uint8_t raw_state[MATRIX_ROWS][MATRIX_COLS] = {0};
     
-    // 保存上次状态
-    memcpy(matrix_key_last_state, matrix_key_state, sizeof(matrix_key_state));
-    
-    // 逐行扫描
+    // 逐行扫描原始值
     for (int row = 0; row < MATRIX_ROWS; row++) {
-        // 当前行拉低
         gpio_set_level(matrix_rows[row], 0);
-        
-        // 延时让电平稳定
         esp_rom_delay_us(10);
-        
-        // 读取列线（按下为低电平）
         for (int col = 0; col < MATRIX_COLS; col++) {
-            matrix_key_state[row][col] = (gpio_get_level(matrix_cols[col]) == 0) ? 1 : 0;
+            raw_state[row][col] = (gpio_get_level(matrix_cols[col]) == 0) ? 1 : 0;
         }
-        
-        // 当前行拉高
         gpio_set_level(matrix_rows[row], 1);
     }
     
-    // 检查是否有变化
+    // 软件消抖：连续读到相同值DEBOUNCE_THRESHOLD次才更新
     for (int row = 0; row < MATRIX_ROWS; row++) {
         for (int col = 0; col < MATRIX_COLS; col++) {
-            if (matrix_key_state[row][col] != matrix_key_last_state[row][col]) {
-                changed = true;
+            if (raw_state[row][col] == matrix_key_state[row][col]) {
+                // 值未变，重置计数器
+                matrix_debounce_count[row][col] = 0;
+            } else {
+                // 值变化，累加计数器
+                matrix_debounce_count[row][col]++;
+                if (matrix_debounce_count[row][col] >= DEBOUNCE_THRESHOLD) {
+                    // 连续N次读到新值，确认变化
+                    matrix_key_last_state[row][col] = matrix_key_state[row][col];
+                    matrix_key_state[row][col] = raw_state[row][col];
+                    matrix_debounce_count[row][col] = 0;
+                    changed = true;
+                }
             }
         }
     }
     
     // 转换为switch1/switch2格式
-    // 行0 = 开关1，行1 = 开关2
-    // 列0=上, 列1=下, 列2=左, 列3=右, 列4=中
     *switch1 = 0;
     *switch2 = 0;
     
@@ -454,21 +455,26 @@ static char target_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = OWL_DEVICE_NAME;
  *                              全局变量
  *============================================================================*/
 
-static bool connect = false;
-static bool get_server = false;
+static volatile bool connect = false;
+static volatile bool get_server = false;
 
 // 序列号（各包类型独立，避免服务器端丢包误报）
-static uint8_t seq_joystick = 0;
-static uint8_t seq_heartbeat = 0;
-static uint8_t seq_switch = 0;
+static volatile uint8_t seq_joystick = 0;
+static volatile uint8_t seq_heartbeat = 0;
+static volatile uint8_t seq_switch = 0;
+static volatile uint8_t seq_command = 0;
 
 // 特征值句柄
-static uint16_t char_control_handle = INVALID_HANDLE;
-static uint16_t char_feedback_handle = INVALID_HANDLE;
-static uint16_t char_command_handle = INVALID_HANDLE;
+static volatile uint16_t char_control_handle = INVALID_HANDLE;
+static volatile uint16_t char_feedback_handle = INVALID_HANDLE;
+static volatile uint16_t char_command_handle = INVALID_HANDLE;
+static volatile uint16_t char_feedback_ccc_handle = INVALID_HANDLE;
 
 // 测试数据发送定时器
 static esp_timer_handle_t test_timer;
+
+// 接收心跳时间（用于检测服务端存活）
+static volatile int64_t last_recv_time = 0;
 
 /*============================================================================
  *                              MAC 绑定功能
@@ -611,7 +617,7 @@ static void build_heartbeat_packet(owl_heartbeat_pkt_t *pkt, uint8_t status, uin
 
 static void build_command_packet(owl_command_pkt_t *pkt, uint8_t cmd, uint8_t param, uint8_t need_ack) {
     pkt->header.version_type = OWL_MAKE_HEADER(OWL_PKT_COMMAND);
-    pkt->header.seq = seq_switch++;  // 复用switch序列号
+    pkt->header.seq = seq_command++;
     pkt->header.timestamp = (uint8_t)(esp_timer_get_time() / 1000);
     pkt->cmd = cmd;
     pkt->param = param;
@@ -621,6 +627,16 @@ static void build_command_packet(owl_command_pkt_t *pkt, uint8_t cmd, uint8_t pa
 /*============================================================================
  *                              数据发送函数
  *============================================================================*/
+
+// BLE写操作辅助宏（检查返回值）
+#define BLE_WRITE_CHAR(if_, cid_, handle_, data_, len_, write_type_) \
+    do { \
+        esp_gatt_status_t _rc = esp_ble_gattc_write_char((if_), (cid_), (handle_), \
+            (len_), (uint8_t*)(data_), (write_type_), ESP_GATT_AUTH_REQ_NONE); \
+        if (_rc != ESP_GATT_OK) { \
+            ESP_LOGW(GATTC_TAG, "BLE写失败: handle=%d rc=0x%x", (handle_), _rc); \
+        } \
+    } while(0)
 
 static void send_joystick_data(void) {
     // 读取真实摇杆值
@@ -632,11 +648,9 @@ static void send_joystick_data(void) {
     build_joystick_packet(&pkt, x, y, btn);
     ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
     ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
-    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                             char_control_handle,
-                             sizeof(pkt), (uint8_t*)&pkt,
-                             ESP_GATT_WRITE_TYPE_NO_RSP,
-                             ESP_GATT_AUTH_REQ_NONE);
+    BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
+                   char_control_handle, &pkt, sizeof(pkt),
+                   ESP_GATT_WRITE_TYPE_NO_RSP);
 }
 
 static void send_switch_data(uint8_t sw1, uint8_t sw2) {
@@ -644,11 +658,9 @@ static void send_switch_data(uint8_t sw1, uint8_t sw2) {
     build_switch_packet(&pkt, sw1, sw2);
     ESP_LOGI(GATTC_TAG, ">>> 发送 SWITCH 包 (矩阵按键)");
     ESP_LOGI(GATTC_TAG, "    开关1=0x%02X, 开关2=0x%02X", pkt.switch1, pkt.switch2);
-    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                             char_control_handle,
-                             sizeof(pkt), (uint8_t*)&pkt,
-                             ESP_GATT_WRITE_TYPE_NO_RSP,
-                             ESP_GATT_AUTH_REQ_NONE);
+    BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
+                   char_control_handle, &pkt, sizeof(pkt),
+                   ESP_GATT_WRITE_TYPE_NO_RSP);
 }
 
 /*============================================================================
@@ -660,18 +672,17 @@ static void send_mode_command(uint8_t cmd, uint8_t param) {
     
     owl_command_pkt_t pkt;
     pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_COMMAND);
-    pkt.header.seq = g_combo_seq++;
+    pkt.header.seq = seq_command++;
     pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
     pkt.cmd = cmd;
     pkt.param = param;
     pkt.need_ack = 1;
     
-    esp_ble_gattc_write_char(gl_profile.gattc_if,
-                               gl_profile.conn_id,
-                               char_control_handle,
-                               sizeof(pkt), (uint8_t*)&pkt,
-                               ESP_GATT_WRITE_TYPE_NO_RSP,
-                               ESP_GATT_AUTH_REQ_NONE);
+    BLE_WRITE_CHAR(gl_profile.gattc_if,
+                   gl_profile.conn_id,
+                   char_control_handle,
+                   &pkt, sizeof(pkt),
+                   ESP_GATT_WRITE_TYPE_NO_RSP);
     ESP_LOGI(GATTC_TAG, "[模式] 发送命令: 0x%02X param=%d", cmd, param);
 }
 
@@ -735,7 +746,7 @@ static void check_combo_keys(uint8_t switch1, uint8_t switch2) {
     }
 }
 
-// 处理猫头鹰发来的事件包
+// 处理猫头鹰发来的事件包（非阻塞，仅更新状态）
 static void handle_event_packet(uint8_t *data, uint16_t len) {
     if (len < 7) return;
     
@@ -747,14 +758,13 @@ static void handle_event_packet(uint8_t *data, uint16_t len) {
     switch (event_type) {
     case OWL_EVENT_INTRUSION_DETECTED:
         ESP_LOGW(GATTC_TAG, "[事件] 检测到入侵! 目标数=%d", p3);
-        // LED2闪红色
+        // LED2闪红色（非阻塞：仅设置颜色，由主循环管理闪烁时序）
         ws2812_set_led(LED_KEY, COLOR_RED);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ws2812_set_led(LED_KEY, COLOR_OFF);
         break;
         
     case OWL_EVENT_INTRUSION_LOST:
         ESP_LOGI(GATTC_TAG, "[事件] 入侵者消失");
+        ws2812_set_led(LED_KEY, COLOR_OFF);
         break;
         
     case OWL_EVENT_PRESET_COMPLETED:
@@ -792,44 +802,26 @@ static void send_heartbeat_data(void) {
     build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
     ESP_LOGI(GATTC_TAG, ">>> 发送 HEARTBEAT 包");
     ESP_LOGI(GATTC_TAG, "    状态=0x%02X, 电池=%d.%dV", pkt.status, pkt.battery/10, pkt.battery%10);
-    esp_ble_gattc_write_char(gl_profile.gattc_if, gl_profile.conn_id,
-                             char_control_handle,
-                             sizeof(pkt), (uint8_t*)&pkt,
-                             ESP_GATT_WRITE_TYPE_NO_RSP,
-                             ESP_GATT_AUTH_REQ_NONE);
-    
-    // 更新心跳时间
-    last_heartbeat_time = esp_timer_get_time() / 1000;
+    BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
+                   char_control_handle, &pkt, sizeof(pkt),
+                   ESP_GATT_WRITE_TYPE_NO_RSP);
 }
 
-// 定时器回调：发送摇杆和心跳数据
+// 定时器回调：仅发送心跳数据（esp_timer回调在ISR上下文，不能做ADC读取）
 static void send_test_data(void *arg) {
     if (!connect || char_control_handle == INVALID_HANDLE) {
         return;
     }
     
-    static int test_phase = 0;
-    
-    switch (test_phase % 2) {
-        case 0: {
-            // 发送真实摇杆数据
-            send_joystick_data();
-            break;
-        }
-        case 1: {
-            // 发送心跳数据
-            send_heartbeat_data();
-            break;
-        }
-    }
-    
-    test_phase++;
+    send_heartbeat_data();
 }
 
-// 按键扫描任务
+// 按键扫描任务（同时负责周期性发送摇杆数据）
 static void key_scan_task(void *arg) {
     uint8_t last_sw1 = 0, last_sw2 = 0;
     uint8_t last_btn = 0;
+    uint8_t combo_cooldown = 0;  // 组合键冷却计数器（防止连续触发）
+    uint8_t joystick_send_counter = 0;  // 摇杆发送计数器（每50次=500ms发一次）
     
     while (1) {
         if (connect && char_control_handle != INVALID_HANDLE) {
@@ -840,15 +832,19 @@ static void key_scan_task(void *arg) {
             uint8_t x, y, btn;
             joystick_read(&x, &y, &btn);
             
+            // 周期性发送摇杆数据（每500ms，替代定时器中的摇杆发送）
+            joystick_send_counter++;
+            if (joystick_send_counter >= 50) {
+                joystick_send_counter = 0;
+                send_joystick_data();
+            }
+            
             // 更新按键LED状态
             ws2812_update_key(sw1, sw2, btn);
             
             // 按键变化时立即发送
             if (changed && (sw1 != last_sw1 || sw2 != last_sw2)) {
                 // 检测组合键（先于普通发送）
-                check_combo_keys(sw1, sw2);
-                
-                // 如果是组合键，不发送普通switch包
                 uint8_t pressed_count = 0;
                 if (sw1 & OWL_SW_UP) pressed_count++;
                 if (sw1 & OWL_SW_DOWN) pressed_count++;
@@ -856,28 +852,32 @@ static void key_scan_task(void *arg) {
                 if (sw1 & OWL_SW_RIGHT) pressed_count++;
                 if (sw1 & OWL_SW_CENTER) pressed_count++;
                 
-                if (pressed_count >= 2) {
-                    ESP_LOGI(GATTC_TAG, "  组合键，不发送SWITCH包");
-                    vTaskDelay(pdMS_TO_TICKS(300));  // 防抖
-                    continue;
+                if (pressed_count >= 2 && combo_cooldown == 0) {
+                    check_combo_keys(sw1, sw2);
+                    combo_cooldown = 30;  // 300ms冷却（30次×10ms扫描周期）
+                    last_sw1 = sw1;
+                    last_sw2 = sw2;
+                } else if (pressed_count < 2) {
+                    // 发送开关状态
+                    ESP_LOGI(GATTC_TAG, "  发送SWITCH包: switch1=0x%02X switch2=0x%02X", sw1, sw2);
+                    send_switch_data(sw1, sw2);
+                    last_sw1 = sw1;
+                    last_sw2 = sw2;
+                    
+                    // 通信LED闪烁
+                    ws2812_update_comm(true);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    ws2812_update_comm(false);
                 }
-                
-                // 发送开关状态
-                ESP_LOGI(GATTC_TAG, "  发送SWITCH包: switch1=0x%02X switch2=0x%02X", sw1, sw2);
-                send_switch_data(sw1, sw2);
-                last_sw1 = sw1;
-                last_sw2 = sw2;
-                
-                // 通信LED闪烁
-                ws2812_update_comm(true);
-                vTaskDelay(pdMS_TO_TICKS(50));
-                ws2812_update_comm(false);
             }
             
             // 摇杆按键变化
             if (btn != last_btn) {
                 last_btn = btn;
             }
+            
+            // 冷却计数器递减
+            if (combo_cooldown > 0) combo_cooldown--;
         }
         
         // 10ms扫描一次
@@ -885,17 +885,18 @@ static void key_scan_task(void *arg) {
     }
 }
 
-// 心跳检测任务
+// 心跳检测任务（检测最后一次接收任何数据的时间）
 static void heartbeat_monitor_task(void *arg) {
     while (1) {
         if (connect) {
-            int64_t now = esp_timer_get_time() / 1000;  // 转换为ms
+            int64_t now = esp_timer_get_time() / 1000;
+            int64_t last_recv = last_recv_time;
             
-            // 检查心跳超时
-            if (last_heartbeat_time > 0 && (now - last_heartbeat_time) > HEARTBEAT_TIMEOUT_MS) {
+            // 检查接收超时（任何Notify/Indicate都更新last_recv_time）
+            if (last_recv > 0 && (now - last_recv) > HEARTBEAT_TIMEOUT_MS) {
                 if (!heartbeat_timeout) {
                     heartbeat_timeout = true;
-                    ESP_LOGW(GATTC_TAG, "⚠️ 心跳超时！可能已断线");
+                    ESP_LOGW(GATTC_TAG, "接收超时！服务端可能已断线");
                     ws2812_update_connection(false);  // LED变红色
                 }
             } else {
@@ -1042,6 +1043,61 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                         char_control_handle = char_elem_result[0].char_handle;
                         ESP_LOGI(GATTC_TAG, "控制通道特征值: handle=%d", char_control_handle);
                     }
+                    
+                    // 获取反馈通道特征值 (Notify)
+                    char_uuid.uuid.uuid16 = REMOTE_CHAR_FEEDBACK_UUID;
+                    uint16_t fb_count = count;
+                    status = esp_ble_gattc_get_char_by_uuid(
+                        gl_profile.gattc_if, gl_profile.conn_id,
+                        gl_profile.service_start_handle, gl_profile.service_end_handle,
+                        char_uuid, char_elem_result, &fb_count);
+                    
+                    if (status == ESP_GATT_OK && fb_count > 0) {
+                        char_feedback_handle = char_elem_result[0].char_handle;
+                        ESP_LOGI(GATTC_TAG, "反馈通道特征值: handle=%d", char_feedback_handle);
+                        
+                        // 获取CCC描述符句柄并注册Notify
+                        esp_gattc_descr_elem_t *descr_result = 
+                            (esp_gattc_descr_elem_t*)malloc(sizeof(esp_gattc_descr_elem_t) * 2);
+                        if (descr_result) {
+                            uint16_t descr_count = 2;
+                            esp_bt_uuid_t ccc_uuid = {
+                                .len = ESP_UUID_LEN_16,
+                                .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG
+                            };
+                            status = esp_ble_gattc_get_descr_by_char_handle(
+                                gl_profile.gattc_if, gl_profile.conn_id,
+                                char_feedback_handle, ccc_uuid,
+                                descr_result, &descr_count);
+                            if (status == ESP_GATT_OK && descr_count > 0) {
+                                char_feedback_ccc_handle = descr_result[0].handle;
+                                // 注册Notify
+                                uint8_t notify_val[2] = {0x01, 0x00};  // Enable notification
+                                esp_ble_gattc_write_char_descr(
+                                    gl_profile.gattc_if, gl_profile.conn_id,
+                                    char_feedback_ccc_handle,
+                                    sizeof(notify_val), notify_val,
+                                    ESP_GATT_WRITE_TYPE_NO_RSP,
+                                    ESP_GATT_AUTH_REQ_NONE);
+                                ESP_LOGI(GATTC_TAG, "已注册Notify (CCC handle=%d)", char_feedback_ccc_handle);
+                            }
+                            free(descr_result);
+                        }
+                    }
+                    
+                    // 获取系统命令特征值
+                    char_uuid.uuid.uuid16 = REMOTE_CHAR_COMMAND_UUID;
+                    uint16_t cmd_count = count;
+                    status = esp_ble_gattc_get_char_by_uuid(
+                        gl_profile.gattc_if, gl_profile.conn_id,
+                        gl_profile.service_start_handle, gl_profile.service_end_handle,
+                        char_uuid, char_elem_result, &cmd_count);
+                    
+                    if (status == ESP_GATT_OK && cmd_count > 0) {
+                        char_command_handle = char_elem_result[0].char_handle;
+                        ESP_LOGI(GATTC_TAG, "系统命令特征值: handle=%d", char_command_handle);
+                    }
+                    
                     free(char_elem_result);
                 }
             }
@@ -1051,8 +1107,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
                 
-                // 初始化心跳时间
-                last_heartbeat_time = esp_timer_get_time() / 1000;
+                // 初始化接收时间
+                last_recv_time = esp_timer_get_time() / 1000;
                 heartbeat_timeout = false;
                 
                 // 更新LED状态：已连接
@@ -1086,6 +1142,9 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         break;
         
     case ESP_GATTC_NOTIFY_EVT:
+        // 更新接收时间（用于心跳超时检测）
+        last_recv_time = esp_timer_get_time() / 1000;
+        
         if (param->notify.handle == char_control_handle || param->notify.handle == char_feedback_handle) {
             uint8_t *p_data = param->notify.value;
             uint16_t p_data_len = param->notify.value_len;
@@ -1116,11 +1175,15 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         connect = false;
         get_server = false;
         char_control_handle = INVALID_HANDLE;
-        last_heartbeat_time = 0;
+        char_feedback_handle = INVALID_HANDLE;
+        char_command_handle = INVALID_HANDLE;
+        char_feedback_ccc_handle = INVALID_HANDLE;
+        last_recv_time = 0;
         // 重置各序列号
         seq_joystick = 0;
         seq_heartbeat = 0;
         seq_switch = 0;
+        seq_command = 0;
         
         if (test_timer != NULL) {
             esp_timer_stop(test_timer);

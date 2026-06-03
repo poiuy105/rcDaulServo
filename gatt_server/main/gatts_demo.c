@@ -14,6 +14,8 @@
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -34,6 +36,9 @@
 
 // 心跳超时配置
 #define HEARTBEAT_TIMEOUT_MS    5000    // 5秒无心跳认为断线
+
+// 全局状态互斥锁
+static SemaphoreHandle_t g_state_mutex = NULL;
 
 // 心跳检测变量
 static int64_t last_heartbeat_time = 0;
@@ -76,9 +81,33 @@ static volatile bool g_recording = false;
 /* 前向声明（解决函数顺序依赖） */
 static void preset_stop(void);
 static void record_save(void);
+static void record_delete(uint8_t slot);
 static uint8_t joystick_to_angle(uint8_t joystick_val);
 static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_t z);
 static uint16_t radar_coord_to_angle(float coord, float gain);
+
+/*============================================================================
+ *                         后台任务队列 (BLE回调解耦)
+ *============================================================================*/
+
+typedef enum {
+    BG_TASK_MODE_SWITCH,
+    BG_TASK_PRESET_START,
+    BG_TASK_PRESET_STOP,
+    BG_TASK_RECORD_START,
+    BG_TASK_RECORD_STOP,
+    BG_TASK_RECORD_DELETE,
+} bg_task_type_t;
+
+typedef struct {
+    bg_task_type_t type;
+    uint8_t param;
+} bg_task_msg_t;
+
+static QueueHandle_t g_bg_task_queue = NULL;
+static TaskHandle_t g_bg_task_handle = NULL;
+
+static void bg_task_worker(void *arg);
 
 /*============================================================================
  *                              舵机 PWM 配置
@@ -177,17 +206,30 @@ static uint8_t last_seq = 0;
 // 心跳检测任务
 static void heartbeat_monitor_task(void *arg) {
     while (1) {
-        if (last_heartbeat_time > 0) {
-            int64_t now = esp_timer_get_time() / 1000;
-            
+        int64_t now = esp_timer_get_time() / 1000;
+        int64_t local_last_heartbeat = 0;
+        uint16_t local_conn_id = 0;
+        esp_gatt_if_t local_gatts_if = 0;
+
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            local_last_heartbeat = last_heartbeat_time;
+            local_conn_id = conn_id_global;
+            local_gatts_if = gatts_if_global;
+            xSemaphoreGive(g_state_mutex);
+        }
+
+        if (local_last_heartbeat > 0) {
             // 检查心跳超时
-            if ((now - last_heartbeat_time) > HEARTBEAT_TIMEOUT_MS) {
-                ESP_LOGW(GATTS_TAG, "⚠️ 心跳超时！客户端可能已断线");
+            if ((now - local_last_heartbeat) > HEARTBEAT_TIMEOUT_MS) {
+                ESP_LOGW(GATTS_TAG, "心跳超时！客户端可能已断线");
                 // 主动断开连接，让客户端重新连接
-                if (conn_id_global > 0) {
-                    esp_ble_gatts_close(gatts_if_global, conn_id_global);
+                if (local_conn_id > 0) {
+                    esp_ble_gatts_close(local_gatts_if, local_conn_id);
                 }
-                last_heartbeat_time = 0;
+                if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    last_heartbeat_time = 0;
+                    xSemaphoreGive(g_state_mutex);
+                }
             }
         }
         
@@ -262,7 +304,10 @@ static void clear_bound_mac(void) {
     
     err = nvs_erase_key(nvs_handle, OWL_KEY_REMOTE_MAC);
     if (err == ESP_OK) {
-        nvs_commit(nvs_handle);
+        esp_err_t commit_err = nvs_commit(nvs_handle);
+        if (commit_err != ESP_OK) {
+            ESP_LOGE(GATTS_TAG, "NVS commit失败: %s", esp_err_to_name(commit_err));
+        }
     }
     
     nvs_close(nvs_handle);
@@ -499,83 +544,124 @@ static void send_ack(uint8_t cmd, uint8_t result) {
  *============================================================================*/
 
 static void security_enter(void) {
-    g_sec_state = SEC_STATE_SCANNING;
-    g_sec_state_enter_time = esp_timer_get_time() / 1000;
-    g_sec_scan_angle = 45;
-    g_sec_scan_dir = 1;
-    g_sec_alarm_on = false;
-    g_sec_last_alarm_time = 0;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_sec_state = SEC_STATE_SCANNING;
+        g_sec_state_enter_time = esp_timer_get_time() / 1000;
+        g_sec_scan_angle = 45;
+        g_sec_scan_dir = 1;
+        g_sec_alarm_on = false;
+        g_sec_last_alarm_time = 0;
+        xSemaphoreGive(g_state_mutex);
+    }
     ESP_LOGI(GATTS_TAG, "[安防模式] 进入，开始巡逻扫描");
 }
 
 static void security_exit(void) {
-    g_sec_alarm_on = false;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_sec_alarm_on = false;
+        relay_light_on = false;
+        relay_sound_on = false;
+        relay_cannon_on = false;
+        servo_x_angle = 90;
+        servo_y_angle = 90;
+        xSemaphoreGive(g_state_mutex);
+    }
     relay_set(RELAY_LIGHT_GPIO, false);
     relay_set(RELAY_SOUND_GPIO, false);
     relay_set(RELAY_CANNON_GPIO, false);
-    relay_light_on = false;
-    relay_sound_on = false;
-    relay_cannon_on = false;
     // 舵机回中
     servo_set_angle(LEDC_X_CHANNEL, 90);
     servo_set_angle(LEDC_Y_CHANNEL, 90);
-    servo_x_angle = 90;
-    servo_y_angle = 90;
     ESP_LOGI(GATTS_TAG, "[安防模式] 退出，舵机回中");
 }
 
 // 安防模式定时更新（100ms调用一次）
 static void security_update(void) {
     int64_t now = esp_timer_get_time() / 1000;
-    
-    switch (g_sec_state) {
+    owl_security_state_t local_sec_state;
+    uint8_t local_scan_angle;
+    int8_t local_scan_dir;
+    bool local_alarm_on;
+    int64_t local_state_enter_time;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    local_sec_state = g_sec_state;
+    local_scan_angle = g_sec_scan_angle;
+    local_scan_dir = g_sec_scan_dir;
+    local_alarm_on = g_sec_alarm_on;
+    local_state_enter_time = g_sec_state_enter_time;
+    xSemaphoreGive(g_state_mutex);
+
+    switch (local_sec_state) {
     case SEC_STATE_SCANNING:
         // 巡逻扫描：45°-135°，10°/秒
-        g_sec_scan_angle += g_sec_scan_dir;
-        if (g_sec_scan_angle >= 135) { g_sec_scan_angle = 135; g_sec_scan_dir = -1; }
-        if (g_sec_scan_angle <= 45)  { g_sec_scan_angle = 45;  g_sec_scan_dir = 1; }
-        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)g_sec_scan_angle);
+        local_scan_angle += local_scan_dir;
+        if (local_scan_angle >= 135) { local_scan_angle = 135; local_scan_dir = -1; }
+        if (local_scan_angle <= 45)  { local_scan_angle = 45;  local_scan_dir = 1; }
+        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)local_scan_angle);
         servo_set_angle(LEDC_Y_CHANNEL, 90);
-        servo_x_angle = (uint8_t)g_sec_scan_angle;
-        servo_y_angle = 90;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_sec_scan_angle = local_scan_angle;
+            g_sec_scan_dir = local_scan_dir;
+            servo_x_angle = (uint8_t)local_scan_angle;
+            servo_y_angle = 90;
+            xSemaphoreGive(g_state_mutex);
+        }
         break;
-        
+
     case SEC_STATE_DETECTED:
-        // 报警：灯光1Hz闪烁，声音间歇响，开炮100ms脉冲
-        if (!g_sec_alarm_on) {
-            g_sec_alarm_on = true;
-            g_sec_last_alarm_time = now;
-            // 开炮威慑：100ms脉冲
+        // 报警：灯光1Hz闪烁，声音间歇响，开炮100ms脉冲（非阻塞）
+        if (!local_alarm_on) {
+            local_alarm_on = true;
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sec_alarm_on = true;
+                g_sec_last_alarm_time = now;
+                xSemaphoreGive(g_state_mutex);
+            }
+            // 开炮威慑：设置GPIO高，下次update时检查100ms后关
             relay_set(RELAY_CANNON_GPIO, true);
-            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        // 检查开炮脉冲是否到期（100ms）
+        if (local_alarm_on && (now - local_state_enter_time) > 100) {
             relay_set(RELAY_CANNON_GPIO, false);
         }
         // 灯光闪烁（1Hz）
         relay_set(RELAY_LIGHT_GPIO, (now % 1000 < 500) ? true : false);
-        relay_light_on = (now % 1000 < 500);
         // 声音间歇（3秒周期：响1秒，停2秒）
         relay_set(RELAY_SOUND_GPIO, (now % 3000 < 1000) ? true : false);
-        relay_sound_on = (now % 3000 < 1000);
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            relay_light_on = (now % 1000 < 500);
+            relay_sound_on = (now % 3000 < 1000);
+            xSemaphoreGive(g_state_mutex);
+        }
         break;
-        
+
     case SEC_STATE_TRACKING:
         // 持续跟踪，灯光闪烁
         relay_set(RELAY_LIGHT_GPIO, (now % 1000 < 500) ? true : false);
-        relay_light_on = (now % 1000 < 500);
         relay_set(RELAY_SOUND_GPIO, (now % 3000 < 1000) ? true : false);
-        relay_sound_on = (now % 3000 < 1000);
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            relay_light_on = (now % 1000 < 500);
+            relay_sound_on = (now % 3000 < 1000);
+            xSemaphoreGive(g_state_mutex);
+        }
         break;
-        
+
     case SEC_STATE_LOST:
         // 保持最后方向3秒
         relay_set(RELAY_LIGHT_GPIO, false);
         relay_set(RELAY_SOUND_GPIO, false);
-        relay_light_on = false;
-        relay_sound_on = false;
-        if ((now - g_sec_state_enter_time) > 3000) {
-            g_sec_state = SEC_STATE_SCANNING;
-            g_sec_state_enter_time = now;
-            ESP_LOGI(GATTS_TAG, "[安防] 目标丢失超时，回到巡逻");
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            relay_light_on = false;
+            relay_sound_on = false;
+            if ((now - local_state_enter_time) > 3000) {
+                g_sec_state = SEC_STATE_SCANNING;
+                g_sec_state_enter_time = now;
+                ESP_LOGI(GATTS_TAG, "[安防] 目标丢失超时，回到巡逻");
+            }
+            xSemaphoreGive(g_state_mutex);
         }
         break;
     }
@@ -583,37 +669,58 @@ static void security_update(void) {
 
 // 安防模式雷达事件处理
 static void security_radar_handler(radar_data_t *data) {
+    owl_security_state_t local_sec_state;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        local_sec_state = g_sec_state;
+        xSemaphoreGive(g_state_mutex);
+    } else {
+        return;
+    }
+
     if (data->target_count > 0) {
         ld6004_target_t *target = &data->targets[0];
         uint16_t angle_x = radar_coord_to_angle(target->x, 45.0f);
         uint16_t angle_y = radar_coord_to_angle(target->y, 45.0f);
-        
+
         servo_set_angle(LEDC_X_CHANNEL, (uint8_t)angle_x);
         servo_set_angle(LEDC_Y_CHANNEL, (uint8_t)angle_y);
-        servo_x_angle = (uint8_t)angle_x;
-        servo_y_angle = (uint8_t)angle_y;
-        
-        if (g_sec_state == SEC_STATE_SCANNING || g_sec_state == SEC_STATE_LOST) {
-            g_sec_state = SEC_STATE_DETECTED;
-            g_sec_state_enter_time = esp_timer_get_time() / 1000;
+
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            servo_x_angle = (uint8_t)angle_x;
+            servo_y_angle = (uint8_t)angle_y;
+            xSemaphoreGive(g_state_mutex);
+        }
+
+        if (local_sec_state == SEC_STATE_SCANNING || local_sec_state == SEC_STATE_LOST) {
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sec_state = SEC_STATE_DETECTED;
+                g_sec_state_enter_time = esp_timer_get_time() / 1000;
+                xSemaphoreGive(g_state_mutex);
+            }
             ESP_LOGI(GATTS_TAG, "[安防] 检测到入侵! x=%.2f y=%.2f", target->x, target->y);
             send_event_notify(OWL_EVENT_INTRUSION_DETECTED,
                             (uint8_t)(target->x * 100 + 128),
                             (uint8_t)(target->y * 100 + 128),
                             data->target_count);
         } else {
-            g_sec_state = SEC_STATE_TRACKING;
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sec_state = SEC_STATE_TRACKING;
+                xSemaphoreGive(g_state_mutex);
+            }
         }
-        
+
         // BLE上报位置
         send_radar_notify(data->target_count,
                          (int16_t)(target->x * 100),
                          (int16_t)(target->y * 100),
                          (int16_t)(target->z * 100));
     } else {
-        if (g_sec_state == SEC_STATE_DETECTED || g_sec_state == SEC_STATE_TRACKING) {
-            g_sec_state = SEC_STATE_LOST;
-            g_sec_state_enter_time = esp_timer_get_time() / 1000;
+        if (local_sec_state == SEC_STATE_DETECTED || local_sec_state == SEC_STATE_TRACKING) {
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_sec_state = SEC_STATE_LOST;
+                g_sec_state_enter_time = esp_timer_get_time() / 1000;
+                xSemaphoreGive(g_state_mutex);
+            }
             ESP_LOGI(GATTS_TAG, "[安防] 入侵者消失");
             send_event_notify(OWL_EVENT_INTRUSION_LOST, 0, 0, 0);
         }
@@ -626,111 +733,156 @@ static void security_radar_handler(radar_data_t *data) {
  *============================================================================*/
 
 static void preset_player_task(void *arg) {
-    ESP_LOGI(GATTS_TAG, "[预设] 开始执行预设槽位 %d", g_preset_slot);
-    
+    uint8_t local_slot = 0;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        local_slot = g_preset_slot;
+        xSemaphoreGive(g_state_mutex);
+    }
+    ESP_LOGI(GATTS_TAG, "[预设] 开始执行预设槽位 %d", local_slot);
+
     // 从NVS读取预设数据
     nvs_handle_t nvs;
     char key[16];
-    snprintf(key, sizeof(key), "preset_%d", g_preset_slot);
-    
+    snprintf(key, sizeof(key), "preset_%d", local_slot);
+
     if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
         ESP_LOGE(GATTS_TAG, "[预设] NVS打开失败");
-        g_preset_running = false;
-        g_preset_task_handle = NULL;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_preset_running = false;
+            g_preset_task_handle = NULL;
+            xSemaphoreGive(g_state_mutex);
+        }
         vTaskDelete(NULL);
         return;
     }
-    
+
     // 先获取数据长度
     size_t blob_len = 0;
     esp_err_t err = nvs_get_blob(nvs, key, NULL, &blob_len);
     if (err != ESP_OK || blob_len == 0 || blob_len % OWL_PRESET_FRAME_SIZE != 0) {
-        ESP_LOGE(GATTS_TAG, "[预设] 槽位 %d 无数据或格式错误 (len=%d)", g_preset_slot, blob_len);
+        ESP_LOGE(GATTS_TAG, "[预设] 槽位 %d 无数据或格式错误 (len=%d)", local_slot, blob_len);
         nvs_close(nvs);
-        g_preset_running = false;
-        g_preset_task_handle = NULL;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_preset_running = false;
+            g_preset_task_handle = NULL;
+            xSemaphoreGive(g_state_mutex);
+        }
         vTaskDelete(NULL);
         return;
     }
-    
+
     uint16_t frame_count = blob_len / OWL_PRESET_FRAME_SIZE;
     preset_frame_t *frames = malloc(blob_len);
     if (!frames) {
         ESP_LOGE(GATTS_TAG, "[预设] 内存分配失败");
         nvs_close(nvs);
-        g_preset_running = false;
-        g_preset_task_handle = NULL;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_preset_running = false;
+            g_preset_task_handle = NULL;
+            xSemaphoreGive(g_state_mutex);
+        }
         vTaskDelete(NULL);
         return;
     }
-    
+
     nvs_get_blob(nvs, key, frames, &blob_len);
     nvs_close(nvs);
-    
+
     ESP_LOGI(GATTS_TAG, "[预设] 读取到 %d 帧数据", frame_count);
-    
+
+    bool local_running = true;
     // 逐帧执行
-    for (uint16_t i = 0; i < frame_count && g_preset_running; i++) {
+    for (uint16_t i = 0; i < frame_count && local_running; i++) {
         preset_frame_t *f = &frames[i];
-        
+
         // 等待帧间隔
         if (f->delay_ms > 0) {
             vTaskDelay(pdMS_TO_TICKS(f->delay_ms));
         }
-        
-        if (!g_preset_running) break;
-        
+
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            local_running = g_preset_running;
+            xSemaphoreGive(g_state_mutex);
+        }
+        if (!local_running) break;
+
         // 执行舵机动作
         if (f->servo_x != OWL_SERVO_NO_CHANGE) {
-            servo_x_angle = f->servo_x;
-            servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
+            servo_set_angle(LEDC_X_CHANNEL, f->servo_x);
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                servo_x_angle = f->servo_x;
+                xSemaphoreGive(g_state_mutex);
+            }
         }
         if (f->servo_y != OWL_SERVO_NO_CHANGE) {
-            servo_y_angle = f->servo_y;
-            servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
+            servo_set_angle(LEDC_Y_CHANNEL, f->servo_y);
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                servo_y_angle = f->servo_y;
+                xSemaphoreGive(g_state_mutex);
+            }
         }
-        
+
         // 执行继电器动作
         relay_set(RELAY_LIGHT_GPIO, (f->relay_flags & OWL_RELAY_EYE_LIGHT) ? true : false);
         relay_set(RELAY_SOUND_GPIO, (f->relay_flags & OWL_RELAY_SOUND) ? true : false);
         relay_set(RELAY_CANNON_GPIO, (f->relay_flags & OWL_RELAY_CANNON) ? true : false);
-        relay_light_on = (f->relay_flags & OWL_RELAY_EYE_LIGHT) != 0;
-        relay_sound_on = (f->relay_flags & OWL_RELAY_SOUND) != 0;
-        relay_cannon_on = (f->relay_flags & OWL_RELAY_CANNON) != 0;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            relay_light_on = (f->relay_flags & OWL_RELAY_EYE_LIGHT) != 0;
+            relay_sound_on = (f->relay_flags & OWL_RELAY_SOUND) != 0;
+            relay_cannon_on = (f->relay_flags & OWL_RELAY_CANNON) != 0;
+            xSemaphoreGive(g_state_mutex);
+        }
     }
-    
+
     free(frames);
-    
-    if (g_preset_running) {
-        ESP_LOGI(GATTS_TAG, "[预设] 执行完成");
-        send_event_notify(OWL_EVENT_PRESET_COMPLETED, g_preset_slot, 0, 0);
+
+    bool was_running = false;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        was_running = g_preset_running;
+        g_preset_running = false;
+        g_preset_task_handle = NULL;
+        xSemaphoreGive(g_state_mutex);
     }
-    
-    g_preset_running = false;
-    g_preset_task_handle = NULL;
+
+    if (was_running) {
+        ESP_LOGI(GATTS_TAG, "[预设] 执行完成");
+        send_event_notify(OWL_EVENT_PRESET_COMPLETED, local_slot, 0, 0);
+    }
+
     vTaskDelete(NULL);
 }
 
 static void preset_enter(void) {
-    g_preset_running = false;
-    g_preset_task_handle = NULL;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_preset_running = false;
+        g_preset_task_handle = NULL;
+        xSemaphoreGive(g_state_mutex);
+    }
     ESP_LOGI(GATTS_TAG, "[预设模式] 进入，等待执行命令");
 }
 
 static void preset_exit(void) {
-    g_preset_running = false;
-    // 等待任务结束
-    if (g_preset_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(200));
+    TaskHandle_t task_to_notify = NULL;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_preset_running = false;
+        task_to_notify = g_preset_task_handle;
+        xSemaphoreGive(g_state_mutex);
     }
-    g_preset_task_handle = NULL;
+    // 使用任务通知等待任务真正结束（最大等待2秒）
+    if (task_to_notify != NULL) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+    }
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_preset_task_handle = NULL;
+        relay_light_on = false;
+        relay_sound_on = false;
+        relay_cannon_on = false;
+        xSemaphoreGive(g_state_mutex);
+    }
     // 继电器全部关闭
     relay_set(RELAY_LIGHT_GPIO, false);
     relay_set(RELAY_SOUND_GPIO, false);
     relay_set(RELAY_CANNON_GPIO, false);
-    relay_light_on = false;
-    relay_sound_on = false;
-    relay_cannon_on = false;
     ESP_LOGI(GATTS_TAG, "[预设模式] 退出");
 }
 
@@ -739,18 +891,29 @@ static void preset_start(uint8_t slot) {
         send_ack(OWL_CMD_PRESET_START, OWL_ERR_INVALID_CMD);
         return;
     }
-    if (g_preset_running) {
+    bool already_running = false;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        already_running = g_preset_running;
+        xSemaphoreGive(g_state_mutex);
+    }
+    if (already_running) {
         preset_stop();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    g_preset_slot = slot;
-    g_preset_running = true;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_preset_slot = slot;
+        g_preset_running = true;
+        xSemaphoreGive(g_state_mutex);
+    }
     xTaskCreate(preset_player_task, "preset_player", 4096, NULL, 5, &g_preset_task_handle);
     send_ack(OWL_CMD_PRESET_START, OWL_ERR_NONE);
 }
 
 static void preset_stop(void) {
-    g_preset_running = false;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_preset_running = false;
+        xSemaphoreGive(g_state_mutex);
+    }
     send_ack(OWL_CMD_PRESET_STOP, OWL_ERR_NONE);
 }
 
@@ -763,77 +926,134 @@ static void record_enter(uint8_t slot) {
         send_ack(OWL_CMD_RECORD_START, OWL_ERR_INVALID_CMD);
         return;
     }
-    g_record_slot = slot;
-    g_record_capacity = OWL_PRESET_MAX_FRAMES;
-    g_record_buffer = malloc(g_record_capacity * OWL_PRESET_FRAME_SIZE);
-    if (!g_record_buffer) {
+    preset_frame_t *buf = malloc(OWL_PRESET_MAX_FRAMES * OWL_PRESET_FRAME_SIZE);
+    if (!buf) {
         ESP_LOGE(GATTS_TAG, "[录制] 内存分配失败");
         send_ack(OWL_CMD_RECORD_START, OWL_ERR_EXEC_FAILED);
         return;
     }
-    g_record_count = 0;
-    g_record_start_time = esp_timer_get_time() / 1000;
-    g_record_last_frame_time = g_record_start_time;
-    g_recording = true;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_record_slot = slot;
+        g_record_capacity = OWL_PRESET_MAX_FRAMES;
+        g_record_buffer = buf;
+        g_record_count = 0;
+        g_record_start_time = esp_timer_get_time() / 1000;
+        g_record_last_frame_time = g_record_start_time;
+        g_recording = true;
+        xSemaphoreGive(g_state_mutex);
+    } else {
+        free(buf);
+        send_ack(OWL_CMD_RECORD_START, OWL_ERR_EXEC_FAILED);
+        return;
+    }
     ESP_LOGI(GATTS_TAG, "[录制] 开始录制到槽位 %d", slot);
     send_event_notify(OWL_EVENT_RECORD_STARTED, slot, 0, 0);
     send_ack(OWL_CMD_RECORD_START, OWL_ERR_NONE);
 }
 
 static void record_exit(void) {
-    g_recording = false;
-    if (g_record_buffer) {
-        free(g_record_buffer);
-        g_record_buffer = NULL;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_recording = false;
+        if (g_record_buffer) {
+            free(g_record_buffer);
+            g_record_buffer = NULL;
+        }
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
     }
-    g_record_count = 0;
     ESP_LOGI(GATTS_TAG, "[录制] 退出录制模式");
 }
 
 static void record_add_joystick_frame(owl_joystick_pkt_t *pkt) {
-    if (!g_recording || !g_record_buffer) return;
-    if (g_record_count >= g_record_capacity) {
+    bool recording = false;
+    preset_frame_t *buf = NULL;
+    uint16_t count = 0;
+    uint16_t capacity = 0;
+    int64_t start_time = 0;
+    int64_t last_frame_time = 0;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        recording = g_recording;
+        buf = g_record_buffer;
+        count = g_record_count;
+        capacity = g_record_capacity;
+        start_time = g_record_start_time;
+        last_frame_time = g_record_last_frame_time;
+        xSemaphoreGive(g_state_mutex);
+    }
+
+    if (!recording || !buf) return;
+    if (count >= capacity) {
         ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
         record_save();
         return;
     }
     // 检查录制时长
     int64_t now = esp_timer_get_time() / 1000;
-    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+    if ((now - start_time) > OWL_PRESET_RECORD_MAX_MS) {
         ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
         record_save();
         return;
     }
-    
-    preset_frame_t *f = &g_record_buffer[g_record_count];
-    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
+
+    preset_frame_t *f = &buf[count];
+    f->delay_ms = (uint16_t)(now - last_frame_time);
     f->servo_x = joystick_to_angle(pkt->x_axis);
     f->servo_y = joystick_to_angle(pkt->y_axis);
-    f->relay_flags = (relay_light_on ? OWL_RELAY_EYE_LIGHT : 0) |
-                      (relay_sound_on ? OWL_RELAY_SOUND : 0) |
-                      (relay_cannon_on ? OWL_RELAY_CANNON : 0);
+
+    bool light_on = false, sound_on = false, cannon_on = false;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        light_on = relay_light_on;
+        sound_on = relay_sound_on;
+        cannon_on = relay_cannon_on;
+        xSemaphoreGive(g_state_mutex);
+    }
+    f->relay_flags = (light_on ? OWL_RELAY_EYE_LIGHT : 0) |
+                      (sound_on ? OWL_RELAY_SOUND : 0) |
+                      (cannon_on ? OWL_RELAY_CANNON : 0);
     f->reserved[0] = 0;
     f->reserved[1] = 0;
-    g_record_last_frame_time = now;
-    g_record_count++;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_record_last_frame_time = now;
+        g_record_count = count + 1;
+        xSemaphoreGive(g_state_mutex);
+    }
 }
 
 static void record_add_switch_frame(owl_switch_pkt_t *pkt) {
-    if (!g_recording || !g_record_buffer) return;
-    if (g_record_count >= g_record_capacity) {
+    bool recording = false;
+    preset_frame_t *buf = NULL;
+    uint16_t count = 0;
+    uint16_t capacity = 0;
+    int64_t start_time = 0;
+    int64_t last_frame_time = 0;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        recording = g_recording;
+        buf = g_record_buffer;
+        count = g_record_count;
+        capacity = g_record_capacity;
+        start_time = g_record_start_time;
+        last_frame_time = g_record_last_frame_time;
+        xSemaphoreGive(g_state_mutex);
+    }
+
+    if (!recording || !buf) return;
+    if (count >= capacity) {
         ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
         record_save();
         return;
     }
     int64_t now = esp_timer_get_time() / 1000;
-    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+    if ((now - start_time) > OWL_PRESET_RECORD_MAX_MS) {
         ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
         record_save();
         return;
     }
-    
-    preset_frame_t *f = &g_record_buffer[g_record_count];
-    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
+
+    preset_frame_t *f = &buf[count];
+    f->delay_ms = (uint16_t)(now - last_frame_time);
     f->servo_x = OWL_SERVO_NO_CHANGE;
     f->servo_y = OWL_SERVO_NO_CHANGE;
     // 记录目标继电器状态（不是变化，而是录制时刻的实际状态）
@@ -842,44 +1062,69 @@ static void record_add_switch_frame(owl_switch_pkt_t *pkt) {
     if (pkt->switch1 & OWL_SW_DOWN) f->relay_flags |= OWL_RELAY_CANNON;
     f->reserved[0] = 0;
     f->reserved[1] = 0;
-    g_record_last_frame_time = now;
-    g_record_count++;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_record_last_frame_time = now;
+        g_record_count = count + 1;
+        xSemaphoreGive(g_state_mutex);
+    }
 }
 
 static void record_save(void) {
-    if (!g_recording) return;
-    g_recording = false;
-    
-    if (g_record_count == 0) {
+    bool was_recording = false;
+    uint8_t local_slot = 0;
+    uint16_t local_count = 0;
+    preset_frame_t *local_buf = NULL;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        was_recording = g_recording;
+        g_recording = false;
+        local_slot = g_record_slot;
+        local_count = g_record_count;
+        local_buf = g_record_buffer;
+        g_record_buffer = NULL;
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
+    }
+
+    if (!was_recording) return;
+
+    if (local_count == 0) {
         ESP_LOGW(GATTS_TAG, "[录制] 无数据，不保存");
+        if (local_buf) free(local_buf);
         send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
         return;
     }
-    
+
     nvs_handle_t nvs;
     if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
         ESP_LOGE(GATTS_TAG, "[录制] NVS打开失败");
+        if (local_buf) free(local_buf);
         send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
         return;
     }
-    
+
     char key[16];
-    snprintf(key, sizeof(key), "preset_%d", g_record_slot);
-    
-    esp_err_t err = nvs_set_blob(nvs, key, g_record_buffer, g_record_count * OWL_PRESET_FRAME_SIZE);
+    snprintf(key, sizeof(key), "preset_%d", local_slot);
+
+    esp_err_t err = nvs_set_blob(nvs, key, local_buf, local_count * OWL_PRESET_FRAME_SIZE);
     if (err == ESP_OK) {
-        nvs_commit(nvs);
-        ESP_LOGI(GATTS_TAG, "[录制] 保存 %d 帧到槽位 %d", g_record_count, g_record_slot);
-        send_event_notify(OWL_EVENT_RECORD_STOPPED, g_record_slot, 
-                          (uint8_t)(g_record_count >> 8), (uint8_t)(g_record_count & 0xFF));
-        send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_NONE);
+        esp_err_t commit_err = nvs_commit(nvs);
+        if (commit_err != ESP_OK) {
+            ESP_LOGE(GATTS_TAG, "[录制] NVS commit失败");
+        } else {
+            ESP_LOGI(GATTS_TAG, "[录制] 保存 %d 帧到槽位 %d", local_count, local_slot);
+            send_event_notify(OWL_EVENT_RECORD_STOPPED, local_slot,
+                              (uint8_t)(local_count >> 8), (uint8_t)(local_count & 0xFF));
+            send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_NONE);
+        }
     } else {
         ESP_LOGE(GATTS_TAG, "[录制] NVS写入失败");
         send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
     }
-    
+
     nvs_close(nvs);
-    g_record_count = 0;
+    if (local_buf) free(local_buf);
 }
 
 static void record_delete(uint8_t slot) {
@@ -889,11 +1134,14 @@ static void record_delete(uint8_t slot) {
     }
     nvs_handle_t nvs;
     if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
-    
+
     char key[16];
     snprintf(key, sizeof(key), "preset_%d", slot);
     nvs_erase_key(nvs, key);
-    nvs_commit(nvs);
+    esp_err_t commit_err = nvs_commit(nvs);
+    if (commit_err != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "[录制] NVS commit失败");
+    }
     nvs_close(nvs);
     ESP_LOGI(GATTS_TAG, "[录制] 已删除预设槽位 %d", slot);
     send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_NONE);
@@ -914,20 +1162,29 @@ static const char *mode_name(owl_mode_t mode) {
 }
 
 static void mode_switch(owl_mode_t new_mode) {
-    if (new_mode == g_current_mode) return;
-    
-    ESP_LOGI(GATTS_TAG, "模式切换: %s → %s", mode_name(g_current_mode), mode_name(new_mode));
-    
+    owl_mode_t local_current = OWL_MODE_REMOTE;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        local_current = g_current_mode;
+        if (new_mode == g_current_mode) {
+            xSemaphoreGive(g_state_mutex);
+            return;
+        }
+        g_current_mode = new_mode;
+        xSemaphoreGive(g_state_mutex);
+    } else {
+        return;
+    }
+
+    ESP_LOGI(GATTS_TAG, "模式切换: %s → %s", mode_name(local_current), mode_name(new_mode));
+
     // 退出当前模式
-    switch (g_current_mode) {
+    switch (local_current) {
         case OWL_MODE_SECURITY: security_exit(); break;
         case OWL_MODE_PRESET:   preset_exit();   break;
         case OWL_MODE_RECORD:   record_exit();   break;
         default: break;
     }
-    
-    g_current_mode = new_mode;
-    
+
     // 进入新模式
     switch (new_mode) {
         case OWL_MODE_REMOTE:   ESP_LOGI(GATTS_TAG, "[遥控模式] 摇杆+按键控制"); break;
@@ -936,14 +1193,19 @@ static void mode_switch(owl_mode_t new_mode) {
         case OWL_MODE_RECORD:   /* record_enter需要slot参数，由command处理 */ break;
         default: break;
     }
-    
+
     send_event_notify(OWL_EVENT_MODE_CHANGED, (uint8_t)new_mode, 0, 0);
 }
 
 // 安防模式定时更新任务
 static void security_task(void *arg) {
     while (1) {
-        if (g_current_mode == OWL_MODE_SECURITY) {
+        owl_mode_t local_mode = OWL_MODE_REMOTE;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            local_mode = g_current_mode;
+            xSemaphoreGive(g_state_mutex);
+        }
+        if (local_mode == OWL_MODE_SECURITY) {
             security_update();
         }
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -958,9 +1220,15 @@ static void radar_event_handler(void *arg, esp_event_base_t event_base,
     }
 
     radar_data_t *data = (radar_data_t *)event_data;
+    owl_mode_t local_mode = OWL_MODE_REMOTE;
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        local_mode = g_current_mode;
+        xSemaphoreGive(g_state_mutex);
+    }
 
     // 仅在安防模式下处理雷达事件
-    if (g_current_mode == OWL_MODE_SECURITY) {
+    if (local_mode == OWL_MODE_SECURITY) {
         security_radar_handler(data);
     } else {
         // 其他模式下仅上报雷达数据，不驱动舵机
@@ -988,28 +1256,34 @@ static void parse_joystick_packet(owl_joystick_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "  X轴: %d (0-255, 中点=128)", pkt->x_axis);
     ESP_LOGI(GATTS_TAG, "  Y轴: %d (0-255, 中点=128)", pkt->y_axis);
     ESP_LOGI(GATTS_TAG, "  按键: %s", (pkt->button_flags & 0x01) ? "按下" : "松开");
-    
-    // 检测丢包
-    int8_t seq_diff = pkt->header.seq - last_seq;
+
+    // 检测丢包（使用回绕安全的序列号比较）
+    int8_t seq_diff = (int8_t)(pkt->header.seq - last_seq);
     if (seq_diff > 1) {
-        ESP_LOGW(GATTS_TAG, "  ⚠️ 检测到丢包! 丢失 %d 个包", seq_diff - 1);
+        ESP_LOGW(GATTS_TAG, "  检测到丢包! 丢失 %d 个包", seq_diff - 1);
     }
-    last_seq = pkt->header.seq;
-    
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        last_seq = pkt->header.seq;
+        xSemaphoreGive(g_state_mutex);
+    }
+
     // 更新舵机角度
     uint8_t new_x_angle = joystick_to_angle(pkt->x_axis);
     uint8_t new_y_angle = joystick_to_angle(pkt->y_axis);
-    
-    if (new_x_angle != servo_x_angle) {
-        servo_x_angle = new_x_angle;
-        servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
-        ESP_LOGI(GATTS_TAG, "  → X舵机更新: %d°", servo_x_angle);
-    }
-    
-    if (new_y_angle != servo_y_angle) {
-        servo_y_angle = new_y_angle;
-        servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
-        ESP_LOGI(GATTS_TAG, "  → Y舵机更新: %d°", servo_y_angle);
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (new_x_angle != servo_x_angle) {
+            servo_x_angle = new_x_angle;
+            servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
+            ESP_LOGI(GATTS_TAG, "  -> X舵机更新: %d°", servo_x_angle);
+        }
+
+        if (new_y_angle != servo_y_angle) {
+            servo_y_angle = new_y_angle;
+            servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
+            ESP_LOGI(GATTS_TAG, "  -> Y舵机更新: %d°", servo_y_angle);
+        }
+        xSemaphoreGive(g_state_mutex);
     }
 }
 
@@ -1030,35 +1304,38 @@ static void parse_switch_packet(owl_switch_pkt_t *pkt) {
              (pkt->switch2 & OWL_SW_LEFT) ? 1 : 0,
              (pkt->switch2 & OWL_SW_RIGHT) ? 1 : 0,
              (pkt->switch2 & OWL_SW_CENTER) ? 1 : 0);
-    
+
     // 继电器控制映射
     // 开关1-中 (0x10) -> 灯光 (IO10)
     // 开关1-上 (0x01) -> 声音 (IO7)
     // 开关1-下 (0x02) -> 开炮 (IO8)
-    
+
     bool light_on = (pkt->switch1 & OWL_SW_CENTER) != 0;
     bool sound_on = (pkt->switch1 & OWL_SW_UP) != 0;
     bool cannon_on = (pkt->switch1 & OWL_SW_DOWN) != 0;
-    
-    // 更新灯光继电器
-    if (light_on != relay_light_on) {
-        relay_light_on = light_on;
-        relay_set(RELAY_LIGHT_GPIO, relay_light_on);
-        ESP_LOGI(GATTS_TAG, "  → 灯光继电器: %s", relay_light_on ? "开" : "关");
-    }
-    
-    // 更新声音继电器
-    if (sound_on != relay_sound_on) {
-        relay_sound_on = sound_on;
-        relay_set(RELAY_SOUND_GPIO, relay_sound_on);
-        ESP_LOGI(GATTS_TAG, "  → 声音继电器: %s", relay_sound_on ? "开" : "关");
-    }
-    
-    // 更新开炮继电器
-    if (cannon_on != relay_cannon_on) {
-        relay_cannon_on = cannon_on;
-        relay_set(RELAY_CANNON_GPIO, relay_cannon_on);
-        ESP_LOGI(GATTS_TAG, "  → 开炮继电器: %s", relay_cannon_on ? "开" : "关");
+
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // 更新灯光继电器
+        if (light_on != relay_light_on) {
+            relay_light_on = light_on;
+            relay_set(RELAY_LIGHT_GPIO, relay_light_on);
+            ESP_LOGI(GATTS_TAG, "  -> 灯光继电器: %s", relay_light_on ? "开" : "关");
+        }
+
+        // 更新声音继电器
+        if (sound_on != relay_sound_on) {
+            relay_sound_on = sound_on;
+            relay_set(RELAY_SOUND_GPIO, relay_sound_on);
+            ESP_LOGI(GATTS_TAG, "  -> 声音继电器: %s", relay_sound_on ? "开" : "关");
+        }
+
+        // 更新开炮继电器
+        if (cannon_on != relay_cannon_on) {
+            relay_cannon_on = cannon_on;
+            relay_set(RELAY_CANNON_GPIO, relay_cannon_on);
+            ESP_LOGI(GATTS_TAG, "  -> 开炮继电器: %s", relay_cannon_on ? "开" : "关");
+        }
+        xSemaphoreGive(g_state_mutex);
     }
 }
 
@@ -1067,9 +1344,54 @@ static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
     ESP_LOGI(GATTS_TAG, "  状态: 0x%02X", pkt->status);
     ESP_LOGI(GATTS_TAG, "  电池: %d.%dV", pkt->battery / 10, pkt->battery % 10);
-    
+
     // 更新心跳时间
-    last_heartbeat_time = esp_timer_get_time() / 1000;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        last_heartbeat_time = esp_timer_get_time() / 1000;
+        xSemaphoreGive(g_state_mutex);
+    }
+}
+
+// 后台任务工作函数（处理NVS操作、模式切换延时、录制/预设启停）
+static void bg_task_worker(void *arg) {
+    bg_task_msg_t msg;
+    while (1) {
+        if (xQueueReceive(g_bg_task_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            switch (msg.type) {
+                case BG_TASK_MODE_SWITCH:
+                    mode_switch((owl_mode_t)msg.param);
+                    break;
+                case BG_TASK_PRESET_START:
+                    preset_start(msg.param);
+                    break;
+                case BG_TASK_PRESET_STOP:
+                    preset_stop();
+                    break;
+                case BG_TASK_RECORD_START:
+                    record_enter(msg.param);
+                    break;
+                case BG_TASK_RECORD_STOP:
+                    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        owl_mode_t local_mode = g_current_mode;
+                        xSemaphoreGive(g_state_mutex);
+                        if (local_mode == OWL_MODE_RECORD) {
+                            record_save();
+                            mode_switch(OWL_MODE_REMOTE);
+                        }
+                    }
+                    break;
+                case BG_TASK_RECORD_DELETE:
+                    record_delete(msg.param);
+                    break;
+            }
+        }
+    }
+}
+
+static bool bg_task_post(bg_task_type_t type, uint8_t param) {
+    if (g_bg_task_queue == NULL) return false;
+    bg_task_msg_t msg = { .type = type, .param = param };
+    return xQueueSend(g_bg_task_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE;
 }
 
 static void parse_command_packet(owl_command_pkt_t *pkt) {
@@ -1078,55 +1400,71 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "  命令码: 0x%02X", pkt->cmd);
     ESP_LOGI(GATTS_TAG, "  参数: 0x%02X", pkt->param);
     ESP_LOGI(GATTS_TAG, "  需确认: %s", pkt->need_ack ? "是" : "否");
-    
+
+    // 通用参数范围校验
+    if (pkt->param > 0x7F) {
+        ESP_LOGW(GATTS_TAG, "  参数超出范围: 0x%02X", pkt->param);
+        send_ack(pkt->cmd, OWL_ERR_INVALID_CMD);
+        return;
+    }
+
     switch (pkt->cmd) {
         // 工作模式命令
         case OWL_CMD_MODE_SWITCH:
-            if (pkt->param <= OWL_MODE_PRESET) {
-                mode_switch((owl_mode_t)pkt->param);
+            if (pkt->param <= OWL_MODE_RECORD) {
+                bg_task_post(BG_TASK_MODE_SWITCH, pkt->param);
                 send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_NONE);
             } else {
                 send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_INVALID_CMD);
             }
             break;
-            
+
         case OWL_CMD_PRESET_START:
-            if (g_current_mode == OWL_MODE_PRESET) {
-                preset_start(pkt->param);
-            } else {
-                // 自动切换到预设模式再执行
-                mode_switch(OWL_MODE_PRESET);
-                preset_start(pkt->param);
+            if (pkt->param >= OWL_PRESET_SLOT_COUNT) {
+                send_ack(OWL_CMD_PRESET_START, OWL_ERR_INVALID_CMD);
+                break;
             }
+            bg_task_post(BG_TASK_PRESET_START, pkt->param);
             break;
-            
+
         case OWL_CMD_PRESET_STOP:
-            preset_stop();
+            bg_task_post(BG_TASK_PRESET_STOP, 0);
             break;
-            
+
         case OWL_CMD_RECORD_START:
-            mode_switch(OWL_MODE_RECORD);
-            record_enter(pkt->param);
-            break;
-            
-        case OWL_CMD_RECORD_STOP:
-            if (g_current_mode == OWL_MODE_RECORD) {
-                record_save();
-                mode_switch(OWL_MODE_REMOTE);
+            if (pkt->param >= OWL_PRESET_SLOT_COUNT) {
+                send_ack(OWL_CMD_RECORD_START, OWL_ERR_INVALID_CMD);
+                break;
             }
+            bg_task_post(BG_TASK_RECORD_START, pkt->param);
             break;
-            
+
+        case OWL_CMD_RECORD_STOP:
+            bg_task_post(BG_TASK_RECORD_STOP, 0);
+            break;
+
         case OWL_CMD_RECORD_DELETE:
-            record_delete(pkt->param);
+            if (pkt->param >= OWL_PRESET_SLOT_COUNT) {
+                send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_INVALID_CMD);
+                break;
+            }
+            bg_task_post(BG_TASK_RECORD_DELETE, pkt->param);
             break;
-        
+
         // 原有命令
         case OWL_CMD_EMERGENCY_STOP:
-            ESP_LOGW(GATTS_TAG, "  ⚠️ 紧急停止!");
+            ESP_LOGW(GATTS_TAG, "  紧急停止!");
             // 停止预设执行
-            if (g_preset_running) preset_stop();
+            preset_stop();
             // 停止录制
-            if (g_recording) { record_save(); mode_switch(OWL_MODE_REMOTE); }
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                bool rec = g_recording;
+                xSemaphoreGive(g_state_mutex);
+                if (rec) {
+                    record_save();
+                    mode_switch(OWL_MODE_REMOTE);
+                }
+            }
             break;
         case OWL_CMD_RESET:
             ESP_LOGI(GATTS_TAG, "  系统复位");
@@ -1146,17 +1484,22 @@ static void parse_control_packet(uint8_t *data, uint16_t len) {
         ESP_LOGW(GATTS_TAG, "数据包太短: %d bytes", len);
         return;
     }
-    
+
     uint8_t pkt_type = OWL_GET_PKT_TYPE((owl_packet_header_t*)data);
-    
+    owl_mode_t local_mode = OWL_MODE_REMOTE;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        local_mode = g_current_mode;
+        xSemaphoreGive(g_state_mutex);
+    }
+
     switch (pkt_type) {
         case OWL_PKT_JOYSTICK:
             if (len >= sizeof(owl_joystick_pkt_t)) {
-                if (g_current_mode == OWL_MODE_REMOTE || g_current_mode == OWL_MODE_RECORD) {
+                if (local_mode == OWL_MODE_REMOTE || local_mode == OWL_MODE_RECORD) {
                     parse_joystick_packet((owl_joystick_pkt_t*)data);
                 }
                 // 录制模式下同时记录帧
-                if (g_current_mode == OWL_MODE_RECORD) {
+                if (local_mode == OWL_MODE_RECORD) {
                     record_add_joystick_frame((owl_joystick_pkt_t*)data);
                 }
                 // 安防/预设模式下忽略摇杆
@@ -1164,11 +1507,11 @@ static void parse_control_packet(uint8_t *data, uint16_t len) {
             break;
         case OWL_PKT_SWITCH:
             if (len >= sizeof(owl_switch_pkt_t)) {
-                if (g_current_mode == OWL_MODE_REMOTE || g_current_mode == OWL_MODE_RECORD) {
+                if (local_mode == OWL_MODE_REMOTE || local_mode == OWL_MODE_RECORD) {
                     parse_switch_packet((owl_switch_pkt_t*)data);
                 }
                 // 录制模式下同时记录帧
-                if (g_current_mode == OWL_MODE_RECORD) {
+                if (local_mode == OWL_MODE_RECORD) {
                     record_add_switch_frame((owl_switch_pkt_t*)data);
                 }
                 // 安防/预设模式下忽略开关
@@ -1314,30 +1657,32 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
     case ESP_GATTS_CONNECT_EVT: {
         ESP_LOGI(GATTS_TAG, "客户端连接, conn_id=%d", param->connect.conn_id);
         ESP_LOGI(GATTS_TAG, "客户端 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->connect.remote_bda));
-        
+
         // MAC 地址验证
         if (!verify_mac(param->connect.remote_bda)) {
-            ESP_LOGW(GATTS_TAG, "⚠️ 未授权设备，断开连接!");
+            ESP_LOGW(GATTS_TAG, "未授权设备，断开连接!");
             ESP_LOGW(GATTS_TAG, "期望 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(g_bound_mac));
             esp_ble_gap_disconnect(param->connect.remote_bda);
             break;
         }
-        
+
         // 首次连接，自动绑定
         if (!g_is_bound) {
             ESP_LOGI(GATTS_TAG, "首次连接，自动绑定设备");
             save_bound_mac(param->connect.remote_bda);
         } else {
-            ESP_LOGI(GATTS_TAG, "✅ 已绑定设备连接成功");
+            ESP_LOGI(GATTS_TAG, "已绑定设备连接成功");
         }
-        
+
         gl_profile.conn_id = param->connect.conn_id;
-        gatts_if_global = gatts_if;
-        conn_id_global = param->connect.conn_id;
-        
-        // 初始化心跳时间
-        last_heartbeat_time = esp_timer_get_time() / 1000;
-        
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            gatts_if_global = gatts_if;
+            conn_id_global = param->connect.conn_id;
+            // 初始化心跳时间
+            last_heartbeat_time = esp_timer_get_time() / 1000;
+            xSemaphoreGive(g_state_mutex);
+        }
+
         // 更新连接参数
         esp_ble_conn_update_params_t conn_params = {0};
         memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
@@ -1348,13 +1693,17 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         esp_ble_gap_update_conn_params(&conn_params);
         break;
     }
-        
+
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(GATTS_TAG, "客户端断开, reason=0x%02x", param->disconnect.reason);
         esp_ble_gap_start_advertising(&adv_params);
         local_mtu = 23;
-        last_seq = 0;
-        last_heartbeat_time = 0;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            last_seq = 0;
+            last_heartbeat_time = 0;
+            conn_id_global = 0;
+            xSemaphoreGive(g_state_mutex);
+        }
         break;
         
     case ESP_GATTS_WRITE_EVT:
@@ -1498,11 +1847,28 @@ void app_main(void) {
         ESP_LOGW(GATTS_TAG, "LD6004 Radar init failed, continuing without radar");
     }
 
+    // 创建全局状态互斥锁
+    g_state_mutex = xSemaphoreCreateMutex();
+    if (g_state_mutex == NULL) {
+        ESP_LOGE(GATTS_TAG, "全局互斥锁创建失败");
+        return;
+    }
+
+    // 创建后台任务队列（用于BLE回调解耦）
+    g_bg_task_queue = xQueueCreate(16, sizeof(bg_task_msg_t));
+    if (g_bg_task_queue == NULL) {
+        ESP_LOGE(GATTS_TAG, "后台任务队列创建失败");
+        return;
+    }
+
     // 初始化舵机
     servo_init();
 
     // 初始化继电器
     relay_init();
+
+    // 启动后台任务（处理NVS操作、模式切换延时、录制/预设启停）
+    xTaskCreate(bg_task_worker, "bg_worker", 4096, NULL, 5, &g_bg_task_handle);
 
     // 启动心跳检测任务
     xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
