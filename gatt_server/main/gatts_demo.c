@@ -46,6 +46,34 @@ static bool radar_enabled = false;
 static uint8_t radar_notify_seq = 0;
 
 /*============================================================================
+ *                              工作模式管理
+ *============================================================================*/
+static owl_mode_t g_current_mode = OWL_MODE_REMOTE;
+static uint8_t feedback_seq = 0;
+
+// 安防模式状态
+static owl_security_state_t g_sec_state = SEC_STATE_SCANNING;
+static int64_t g_sec_state_enter_time = 0;
+static uint8_t g_sec_scan_angle = 45;
+static int8_t g_sec_scan_dir = 1;  // 1=正向, -1=反向
+static bool g_sec_alarm_on = false;
+static int64_t g_sec_last_alarm_time = 0;
+
+// 预设模式状态
+static TaskHandle_t g_preset_task_handle = NULL;
+static volatile bool g_preset_running = false;
+static uint8_t g_preset_slot = 0;
+
+// 录制模式状态
+static preset_frame_t *g_record_buffer = NULL;
+static uint16_t g_record_count = 0;
+static uint16_t g_record_capacity = 0;
+static uint8_t g_record_slot = 0;
+static int64_t g_record_start_time = 0;
+static int64_t g_record_last_frame_time = 0;
+static volatile bool g_recording = false;
+
+/*============================================================================
  *                              舵机 PWM 配置
  *============================================================================*/
 
@@ -414,6 +442,507 @@ static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_
                                  sizeof(pkt), pkt, false);
 }
 
+/*============================================================================
+ *                              BLE 反馈发送辅助函数
+ *============================================================================*/
+
+// 发送事件包（通过反馈通道 Notify）
+static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_t p3) {
+    if (gl_profile.conn_id == 0) return;
+    
+    owl_event_pkt_t pkt;
+    pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_EVENT);
+    pkt.header.seq = feedback_seq++;
+    pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
+    pkt.event_type = event_code;
+    pkt.event_param = p1;
+    
+    // 使用原始Notify发送7字节（header 3字节 + event_type + event_param + 2 extra bytes）
+    uint8_t buf[7];
+    memcpy(buf, &pkt, sizeof(owl_event_pkt_t));
+    buf[5] = p2;
+    buf[6] = p3;
+    
+    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+                                 gl_profile.conn_id,
+                                 gl_profile.descr_feedback_handle,
+                                 sizeof(buf), buf, false);
+}
+
+// 发送ACK包
+static void send_ack(uint8_t cmd, uint8_t result) {
+    if (gl_profile.conn_id == 0) return;
+    
+    owl_ack_pkt_t pkt;
+    pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_ACK);
+    pkt.header.seq = feedback_seq++;
+    pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
+    pkt.cmd = cmd;
+    pkt.result = result;
+    pkt.data = 0;
+    
+    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+                                 gl_profile.conn_id,
+                                 gl_profile.descr_feedback_handle,
+                                 sizeof(pkt), (uint8_t*)&pkt, false);
+}
+
+/*============================================================================
+ *                              安防模式
+ *============================================================================*/
+
+static void security_enter(void) {
+    g_sec_state = SEC_STATE_SCANNING;
+    g_sec_state_enter_time = esp_timer_get_time() / 1000;
+    g_sec_scan_angle = 45;
+    g_sec_scan_dir = 1;
+    g_sec_alarm_on = false;
+    g_sec_last_alarm_time = 0;
+    ESP_LOGI(GATTS_TAG, "[安防模式] 进入，开始巡逻扫描");
+}
+
+static void security_exit(void) {
+    g_sec_alarm_on = false;
+    relay_set(RELAY_LIGHT_GPIO, false);
+    relay_set(RELAY_SOUND_GPIO, false);
+    relay_set(RELAY_CANNON_GPIO, false);
+    relay_light_on = false;
+    relay_sound_on = false;
+    relay_cannon_on = false;
+    // 舵机回中
+    servo_set_angle(LEDC_X_CHANNEL, 90);
+    servo_set_angle(LEDC_Y_CHANNEL, 90);
+    servo_x_angle = 90;
+    servo_y_angle = 90;
+    ESP_LOGI(GATTS_TAG, "[安防模式] 退出，舵机回中");
+}
+
+// 安防模式定时更新（100ms调用一次）
+static void security_update(void) {
+    int64_t now = esp_timer_get_time() / 1000;
+    
+    switch (g_sec_state) {
+    case SEC_STATE_SCANNING:
+        // 巡逻扫描：45°-135°，10°/秒
+        g_sec_scan_angle += g_sec_scan_dir;
+        if (g_sec_scan_angle >= 135) { g_sec_scan_angle = 135; g_sec_scan_dir = -1; }
+        if (g_sec_scan_angle <= 45)  { g_sec_scan_angle = 45;  g_sec_scan_dir = 1; }
+        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)g_sec_scan_angle);
+        servo_set_angle(LEDC_Y_CHANNEL, 90);
+        servo_x_angle = (uint8_t)g_sec_scan_angle;
+        servo_y_angle = 90;
+        break;
+        
+    case SEC_STATE_DETECTED:
+        // 报警：灯光1Hz闪烁，声音间歇响，开炮100ms脉冲
+        if (!g_sec_alarm_on) {
+            g_sec_alarm_on = true;
+            g_sec_last_alarm_time = now;
+            // 开炮威慑：100ms脉冲
+            relay_set(RELAY_CANNON_GPIO, true);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            relay_set(RELAY_CANNON_GPIO, false);
+        }
+        // 灯光闪烁（1Hz）
+        relay_set(RELAY_LIGHT_GPIO, (now % 1000 < 500) ? true : false);
+        relay_light_on = (now % 1000 < 500);
+        // 声音间歇（3秒周期：响1秒，停2秒）
+        relay_set(RELAY_SOUND_GPIO, (now % 3000 < 1000) ? true : false);
+        relay_sound_on = (now % 3000 < 1000);
+        break;
+        
+    case SEC_STATE_TRACKING:
+        // 持续跟踪，灯光闪烁
+        relay_set(RELAY_LIGHT_GPIO, (now % 1000 < 500) ? true : false);
+        relay_light_on = (now % 1000 < 500);
+        relay_set(RELAY_SOUND_GPIO, (now % 3000 < 1000) ? true : false);
+        relay_sound_on = (now % 3000 < 1000);
+        break;
+        
+    case SEC_STATE_LOST:
+        // 保持最后方向3秒
+        relay_set(RELAY_LIGHT_GPIO, false);
+        relay_set(RELAY_SOUND_GPIO, false);
+        relay_light_on = false;
+        relay_sound_on = false;
+        if ((now - g_sec_state_enter_time) > 3000) {
+            g_sec_state = SEC_STATE_SCANNING;
+            g_sec_state_enter_time = now;
+            ESP_LOGI(GATTS_TAG, "[安防] 目标丢失超时，回到巡逻");
+        }
+        break;
+    }
+}
+
+// 安防模式雷达事件处理
+static void security_radar_handler(radar_data_t *data) {
+    if (data->target_count > 0) {
+        ld6004_target_t *target = &data->targets[0];
+        uint16_t angle_x = radar_coord_to_angle(target->x, 45.0f);
+        uint16_t angle_y = radar_coord_to_angle(target->y, 45.0f);
+        
+        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)angle_x);
+        servo_set_angle(LEDC_Y_CHANNEL, (uint8_t)angle_y);
+        servo_x_angle = (uint8_t)angle_x;
+        servo_y_angle = (uint8_t)angle_y;
+        
+        if (g_sec_state == SEC_STATE_SCANNING || g_sec_state == SEC_STATE_LOST) {
+            g_sec_state = SEC_STATE_DETECTED;
+            g_sec_state_enter_time = esp_timer_get_time() / 1000;
+            ESP_LOGI(GATTS_TAG, "[安防] 检测到入侵! x=%.2f y=%.2f", target->x, target->y);
+            send_event_notify(OWL_EVENT_INTRUSION_DETECTED,
+                            (uint8_t)(target->x * 100 + 128),
+                            (uint8_t)(target->y * 100 + 128),
+                            data->target_count);
+        } else {
+            g_sec_state = SEC_STATE_TRACKING;
+        }
+        
+        // BLE上报位置
+        send_radar_notify(data->target_count,
+                         (int16_t)(target->x * 100),
+                         (int16_t)(target->y * 100),
+                         (int16_t)(target->z * 100));
+    } else {
+        if (g_sec_state == SEC_STATE_DETECTED || g_sec_state == SEC_STATE_TRACKING) {
+            g_sec_state = SEC_STATE_LOST;
+            g_sec_state_enter_time = esp_timer_get_time() / 1000;
+            ESP_LOGI(GATTS_TAG, "[安防] 入侵者消失");
+            send_event_notify(OWL_EVENT_INTRUSION_LOST, 0, 0, 0);
+        }
+        send_radar_notify(0, 0, 0, 0);
+    }
+}
+
+/*============================================================================
+ *                              预设模式
+ *============================================================================*/
+
+static void preset_player_task(void *arg) {
+    ESP_LOGI(GATTS_TAG, "[预设] 开始执行预设槽位 %d", g_preset_slot);
+    
+    // 从NVS读取预设数据
+    nvs_handle_t nvs;
+    char key[16];
+    snprintf(key, sizeof(key), "preset_%d", g_preset_slot);
+    
+    if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "[预设] NVS打开失败");
+        g_preset_running = false;
+        g_preset_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // 先获取数据长度
+    size_t blob_len = 0;
+    esp_err_t err = nvs_get_blob(nvs, key, NULL, &blob_len);
+    if (err != ESP_OK || blob_len == 0 || blob_len % OWL_PRESET_FRAME_SIZE != 0) {
+        ESP_LOGE(GATTS_TAG, "[预设] 槽位 %d 无数据或格式错误 (len=%d)", g_preset_slot, blob_len);
+        nvs_close(nvs);
+        g_preset_running = false;
+        g_preset_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    uint16_t frame_count = blob_len / OWL_PRESET_FRAME_SIZE;
+    preset_frame_t *frames = malloc(blob_len);
+    if (!frames) {
+        ESP_LOGE(GATTS_TAG, "[预设] 内存分配失败");
+        nvs_close(nvs);
+        g_preset_running = false;
+        g_preset_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    nvs_get_blob(nvs, key, frames, &blob_len);
+    nvs_close(nvs);
+    
+    ESP_LOGI(GATTS_TAG, "[预设] 读取到 %d 帧数据", frame_count);
+    
+    // 逐帧执行
+    for (uint16_t i = 0; i < frame_count && g_preset_running; i++) {
+        preset_frame_t *f = &frames[i];
+        
+        // 等待帧间隔
+        if (f->delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(f->delay_ms));
+        }
+        
+        if (!g_preset_running) break;
+        
+        // 执行舵机动作
+        if (f->servo_x != OWL_SERVO_NO_CHANGE) {
+            servo_x_angle = f->servo_x;
+            servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
+        }
+        if (f->servo_y != OWL_SERVO_NO_CHANGE) {
+            servo_y_angle = f->servo_y;
+            servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
+        }
+        
+        // 执行继电器动作
+        relay_set(RELAY_LIGHT_GPIO, (f->relay_flags & OWL_RELAY_EYE_LIGHT) ? true : false);
+        relay_set(RELAY_SOUND_GPIO, (f->relay_flags & OWL_RELAY_SOUND) ? true : false);
+        relay_set(RELAY_CANNON_GPIO, (f->relay_flags & OWL_RELAY_CANNON) ? true : false);
+        relay_light_on = (f->relay_flags & OWL_RELAY_EYE_LIGHT) != 0;
+        relay_sound_on = (f->relay_flags & OWL_RELAY_SOUND) != 0;
+        relay_cannon_on = (f->relay_flags & OWL_RELAY_CANNON) != 0;
+    }
+    
+    free(frames);
+    
+    if (g_preset_running) {
+        ESP_LOGI(GATTS_TAG, "[预设] 执行完成");
+        send_event_notify(OWL_EVENT_PRESET_COMPLETED, g_preset_slot, 0, 0);
+    }
+    
+    g_preset_running = false;
+    g_preset_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void preset_enter(void) {
+    g_preset_running = false;
+    g_preset_task_handle = NULL;
+    ESP_LOGI(GATTS_TAG, "[预设模式] 进入，等待执行命令");
+}
+
+static void preset_exit(void) {
+    g_preset_running = false;
+    // 等待任务结束
+    if (g_preset_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    g_preset_task_handle = NULL;
+    // 继电器全部关闭
+    relay_set(RELAY_LIGHT_GPIO, false);
+    relay_set(RELAY_SOUND_GPIO, false);
+    relay_set(RELAY_CANNON_GPIO, false);
+    relay_light_on = false;
+    relay_sound_on = false;
+    relay_cannon_on = false;
+    ESP_LOGI(GATTS_TAG, "[预设模式] 退出");
+}
+
+static void preset_start(uint8_t slot) {
+    if (slot >= OWL_PRESET_SLOT_COUNT) {
+        send_ack(OWL_CMD_PRESET_START, OWL_ERR_INVALID_CMD);
+        return;
+    }
+    if (g_preset_running) {
+        preset_stop();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    g_preset_slot = slot;
+    g_preset_running = true;
+    xTaskCreate(preset_player_task, "preset_player", 4096, NULL, 5, &g_preset_task_handle);
+    send_ack(OWL_CMD_PRESET_START, OWL_ERR_NONE);
+}
+
+static void preset_stop(void) {
+    g_preset_running = false;
+    send_ack(OWL_CMD_PRESET_STOP, OWL_ERR_NONE);
+}
+
+/*============================================================================
+ *                              录制模式
+ *============================================================================*/
+
+static void record_enter(uint8_t slot) {
+    if (slot >= OWL_PRESET_SLOT_COUNT) {
+        send_ack(OWL_CMD_RECORD_START, OWL_ERR_INVALID_CMD);
+        return;
+    }
+    g_record_slot = slot;
+    g_record_capacity = OWL_PRESET_MAX_FRAMES;
+    g_record_buffer = malloc(g_record_capacity * OWL_PRESET_FRAME_SIZE);
+    if (!g_record_buffer) {
+        ESP_LOGE(GATTS_TAG, "[录制] 内存分配失败");
+        send_ack(OWL_CMD_RECORD_START, OWL_ERR_EXEC_FAILED);
+        return;
+    }
+    g_record_count = 0;
+    g_record_start_time = esp_timer_get_time() / 1000;
+    g_record_last_frame_time = g_record_start_time;
+    g_recording = true;
+    ESP_LOGI(GATTS_TAG, "[录制] 开始录制到槽位 %d", slot);
+    send_event_notify(OWL_EVENT_RECORD_STARTED, slot, 0, 0);
+    send_ack(OWL_CMD_RECORD_START, OWL_ERR_NONE);
+}
+
+static void record_exit(void) {
+    g_recording = false;
+    if (g_record_buffer) {
+        free(g_record_buffer);
+        g_record_buffer = NULL;
+    }
+    g_record_count = 0;
+    ESP_LOGI(GATTS_TAG, "[录制] 退出录制模式");
+}
+
+static void record_add_joystick_frame(owl_joystick_pkt_t *pkt) {
+    if (!g_recording || !g_record_buffer) return;
+    if (g_record_count >= g_record_capacity) {
+        ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
+        record_save();
+        return;
+    }
+    // 检查录制时长
+    int64_t now = esp_timer_get_time() / 1000;
+    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+        ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
+        record_save();
+        return;
+    }
+    
+    preset_frame_t *f = &g_record_buffer[g_record_count];
+    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
+    f->servo_x = joystick_to_angle(pkt->x_axis);
+    f->servo_y = joystick_to_angle(pkt->y_axis);
+    f->relay_flags = (relay_light_on ? OWL_RELAY_EYE_LIGHT : 0) |
+                      (relay_sound_on ? OWL_RELAY_SOUND : 0) |
+                      (relay_cannon_on ? OWL_RELAY_CANNON : 0);
+    f->reserved[0] = 0;
+    f->reserved[1] = 0;
+    g_record_last_frame_time = now;
+    g_record_count++;
+}
+
+static void record_add_switch_frame(owl_switch_pkt_t *pkt) {
+    if (!g_recording || !g_record_buffer) return;
+    if (g_record_count >= g_record_capacity) {
+        ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
+        record_save();
+        return;
+    }
+    int64_t now = esp_timer_get_time() / 1000;
+    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+        ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
+        record_save();
+        return;
+    }
+    
+    preset_frame_t *f = &g_record_buffer[g_record_count];
+    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
+    f->servo_x = OWL_SERVO_NO_CHANGE;
+    f->servo_y = OWL_SERVO_NO_CHANGE;
+    // 记录目标继电器状态（不是变化，而是录制时刻的实际状态）
+    f->relay_flags = (pkt->switch1 & OWL_SW_CENTER) ? OWL_RELAY_EYE_LIGHT : 0;
+    if (pkt->switch1 & OWL_SW_UP) f->relay_flags |= OWL_RELAY_SOUND;
+    if (pkt->switch1 & OWL_SW_DOWN) f->relay_flags |= OWL_RELAY_CANNON;
+    f->reserved[0] = 0;
+    f->reserved[1] = 0;
+    g_record_last_frame_time = now;
+    g_record_count++;
+}
+
+static void record_save(void) {
+    if (!g_recording) return;
+    g_recording = false;
+    
+    if (g_record_count == 0) {
+        ESP_LOGW(GATTS_TAG, "[录制] 无数据，不保存");
+        send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
+        return;
+    }
+    
+    nvs_handle_t nvs;
+    if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "[录制] NVS打开失败");
+        send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
+        return;
+    }
+    
+    char key[16];
+    snprintf(key, sizeof(key), "preset_%d", g_record_slot);
+    
+    esp_err_t err = nvs_set_blob(nvs, key, g_record_buffer, g_record_count * OWL_PRESET_FRAME_SIZE);
+    if (err == ESP_OK) {
+        nvs_commit(nvs);
+        ESP_LOGI(GATTS_TAG, "[录制] 保存 %d 帧到槽位 %d", g_record_count, g_record_slot);
+        send_event_notify(OWL_EVENT_RECORD_STOPPED, g_record_slot, 
+                          (uint8_t)(g_record_count >> 8), (uint8_t)(g_record_count & 0xFF));
+        send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_NONE);
+    } else {
+        ESP_LOGE(GATTS_TAG, "[录制] NVS写入失败");
+        send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
+    }
+    
+    nvs_close(nvs);
+    g_record_count = 0;
+}
+
+static void record_delete(uint8_t slot) {
+    if (slot >= OWL_PRESET_SLOT_COUNT) {
+        send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_INVALID_CMD);
+        return;
+    }
+    nvs_handle_t nvs;
+    if (nvs_open(OWL_PRESETS_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    
+    char key[16];
+    snprintf(key, sizeof(key), "preset_%d", slot);
+    nvs_erase_key(nvs, key);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    ESP_LOGI(GATTS_TAG, "[录制] 已删除预设槽位 %d", slot);
+    send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_NONE);
+}
+
+/*============================================================================
+ *                              模式切换核心
+ *============================================================================*/
+
+static const char *mode_name(owl_mode_t mode) {
+    switch (mode) {
+        case OWL_MODE_REMOTE:   return "遥控模式";
+        case OWL_MODE_SECURITY: return "安防模式";
+        case OWL_MODE_PRESET:   return "预设模式";
+        case OWL_MODE_RECORD:   return "录制模式";
+        default: return "未知";
+    }
+}
+
+static void mode_switch(owl_mode_t new_mode) {
+    if (new_mode == g_current_mode) return;
+    
+    ESP_LOGI(GATTS_TAG, "模式切换: %s → %s", mode_name(g_current_mode), mode_name(new_mode));
+    
+    // 退出当前模式
+    switch (g_current_mode) {
+        case OWL_MODE_SECURITY: security_exit(); break;
+        case OWL_MODE_PRESET:   preset_exit();   break;
+        case OWL_MODE_RECORD:   record_exit();   break;
+        default: break;
+    }
+    
+    g_current_mode = new_mode;
+    
+    // 进入新模式
+    switch (new_mode) {
+        case OWL_MODE_REMOTE:   ESP_LOGI(GATTS_TAG, "[遥控模式] 摇杆+按键控制"); break;
+        case OWL_MODE_SECURITY: security_enter(); break;
+        case OWL_MODE_PRESET:   preset_enter();   break;
+        case OWL_MODE_RECORD:   /* record_enter需要slot参数，由command处理 */ break;
+        default: break;
+    }
+    
+    send_event_notify(OWL_EVENT_MODE_CHANGED, (uint8_t)new_mode, 0, 0);
+}
+
+// 安防模式定时更新任务
+static void security_task(void *arg) {
+    while (1) {
+        if (g_current_mode == OWL_MODE_SECURITY) {
+            security_update();
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
 // 雷达事件处理器
 static void radar_event_handler(void *arg, esp_event_base_t event_base,
                                   int32_t event_id, void *event_data) {
@@ -423,32 +952,20 @@ static void radar_event_handler(void *arg, esp_event_base_t event_base,
 
     radar_data_t *data = (radar_data_t *)event_data;
 
-    if (data->target_count > 0) {
-        // 有目标: 舵机跟踪
-        ld6004_target_t *target = &data->targets[0];
-
-        uint16_t angle_x = radar_coord_to_angle(target->x, 45.0f);
-        uint16_t angle_y = radar_coord_to_angle(target->y, 45.0f);
-
-        servo_set_angle(LEDC_X_CHANNEL, (uint8_t)angle_x);
-        servo_set_angle(LEDC_Y_CHANNEL, (uint8_t)angle_y);
-
-        ESP_LOGI(GATTS_TAG, "Radar target: x=%.2f y=%.2f z=%.2f -> servo: %d %d",
-                 target->x, target->y, target->z, angle_x, angle_y);
-
-        // BLE 上报 (坐标转换为厘米)
-        send_radar_notify(data->target_count,
-                         (int16_t)(target->x * 100),
-                         (int16_t)(target->y * 100),
-                         (int16_t)(target->z * 100));
+    // 仅在安防模式下处理雷达事件
+    if (g_current_mode == OWL_MODE_SECURITY) {
+        security_radar_handler(data);
     } else {
-        // 无目标: 舵机回中点
-        servo_set_angle(LEDC_X_CHANNEL, 90);
-        servo_set_angle(LEDC_Y_CHANNEL, 90);
-
-        ESP_LOGI(GATTS_TAG, "Radar: no target, servo return to center");
-
-        send_radar_notify(0, 0, 0, 0);
+        // 其他模式下仅上报雷达数据，不驱动舵机
+        if (data->target_count > 0) {
+            ld6004_target_t *target = &data->targets[0];
+            send_radar_notify(data->target_count,
+                             (int16_t)(target->x * 100),
+                             (int16_t)(target->y * 100),
+                             (int16_t)(target->z * 100));
+        } else {
+            send_radar_notify(0, 0, 0, 0);
+        }
     }
 }
 
@@ -555,10 +1072,54 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
     ESP_LOGI(GATTS_TAG, "  参数: 0x%02X", pkt->param);
     ESP_LOGI(GATTS_TAG, "  需确认: %s", pkt->need_ack ? "是" : "否");
     
-    // 命令解析
     switch (pkt->cmd) {
+        // 工作模式命令
+        case OWL_CMD_MODE_SWITCH:
+            if (pkt->param <= OWL_MODE_PRESET) {
+                mode_switch((owl_mode_t)pkt->param);
+                send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_NONE);
+            } else {
+                send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_INVALID_CMD);
+            }
+            break;
+            
+        case OWL_CMD_PRESET_START:
+            if (g_current_mode == OWL_MODE_PRESET) {
+                preset_start(pkt->param);
+            } else {
+                // 自动切换到预设模式再执行
+                mode_switch(OWL_MODE_PRESET);
+                preset_start(pkt->param);
+            }
+            break;
+            
+        case OWL_CMD_PRESET_STOP:
+            preset_stop();
+            break;
+            
+        case OWL_CMD_RECORD_START:
+            mode_switch(OWL_MODE_RECORD);
+            record_enter(pkt->param);
+            break;
+            
+        case OWL_CMD_RECORD_STOP:
+            if (g_current_mode == OWL_MODE_RECORD) {
+                record_save();
+                mode_switch(OWL_MODE_REMOTE);
+            }
+            break;
+            
+        case OWL_CMD_RECORD_DELETE:
+            record_delete(pkt->param);
+            break;
+        
+        // 原有命令
         case OWL_CMD_EMERGENCY_STOP:
             ESP_LOGW(GATTS_TAG, "  ⚠️ 紧急停止!");
+            // 停止预设执行
+            if (g_preset_running) preset_stop();
+            // 停止录制
+            if (g_recording) { record_save(); mode_switch(OWL_MODE_REMOTE); }
             break;
         case OWL_CMD_RESET:
             ESP_LOGI(GATTS_TAG, "  系统复位");
@@ -568,6 +1129,7 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
             break;
         default:
             ESP_LOGI(GATTS_TAG, "  未知命令");
+            send_ack(pkt->cmd, OWL_ERR_INVALID_CMD);
             break;
     }
 }
@@ -583,12 +1145,26 @@ static void parse_control_packet(uint8_t *data, uint16_t len) {
     switch (pkt_type) {
         case OWL_PKT_JOYSTICK:
             if (len >= sizeof(owl_joystick_pkt_t)) {
-                parse_joystick_packet((owl_joystick_pkt_t*)data);
+                if (g_current_mode == OWL_MODE_REMOTE || g_current_mode == OWL_MODE_RECORD) {
+                    parse_joystick_packet((owl_joystick_pkt_t*)data);
+                }
+                // 录制模式下同时记录帧
+                if (g_current_mode == OWL_MODE_RECORD) {
+                    record_add_joystick_frame((owl_joystick_pkt_t*)data);
+                }
+                // 安防/预设模式下忽略摇杆
             }
             break;
         case OWL_PKT_SWITCH:
             if (len >= sizeof(owl_switch_pkt_t)) {
-                parse_switch_packet((owl_switch_pkt_t*)data);
+                if (g_current_mode == OWL_MODE_REMOTE || g_current_mode == OWL_MODE_RECORD) {
+                    parse_switch_packet((owl_switch_pkt_t*)data);
+                }
+                // 录制模式下同时记录帧
+                if (g_current_mode == OWL_MODE_RECORD) {
+                    record_add_switch_frame((owl_switch_pkt_t*)data);
+                }
+                // 安防/预设模式下忽略开关
             }
             break;
         case OWL_PKT_HEARTBEAT:
@@ -923,6 +1499,9 @@ void app_main(void) {
 
     // 启动心跳检测任务
     xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
+
+    // 启动安防模式定时更新任务
+    xTaskCreate(security_task, "security", 4096, NULL, 4, NULL);
 
     ESP_LOGI(GATTS_TAG, "猫头鹰 BLE 服务端初始化完成");
     ESP_LOGI(GATTS_TAG, "设备名: %s", OWL_DEVICE_NAME);

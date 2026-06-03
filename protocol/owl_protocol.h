@@ -80,6 +80,14 @@ extern "C" {
 #define OWL_CMD_EMERGENCY_STOP      0x09    // 紧急停止
 #define OWL_CMD_OTA_START           0x0A    // OTA 开始
 
+/* 工作模式命令码 */
+#define OWL_CMD_MODE_SWITCH         0x10    // 切换工作模式 (param: 0=遥控, 1=安防, 2=预设)
+#define OWL_CMD_PRESET_START        0x11    // 开始执行预设 (param: 槽位0-3)
+#define OWL_CMD_PRESET_STOP         0x12    // 停止执行预设
+#define OWL_CMD_RECORD_START       0x13    // 开始录制 (param: 槽位0-3)
+#define OWL_CMD_RECORD_STOP        0x14    // 停止录制并保存
+#define OWL_CMD_RECORD_DELETE      0x15    // 删除预设 (param: 槽位0-3)
+
 /*============================================================================
  *                              事件类型定义
  *============================================================================*/
@@ -90,6 +98,14 @@ extern "C" {
 #define OWL_EVENT_SERVO_STALL       0x04    // 舵机堵转
 #define OWL_EVENT_SLEEP             0x05    // 进入休眠
 #define OWL_EVENT_WAKEUP            0x06    // 被唤醒
+
+/* 工作模式事件类型 */
+#define OWL_EVENT_INTRUSION_DETECTED  0x10  // 检测到入侵
+#define OWL_EVENT_INTRUSION_LOST      0x11  // 入侵者消失
+#define OWL_EVENT_PRESET_COMPLETED    0x12  // 预设执行完成
+#define OWL_EVENT_RECORD_STARTED      0x13  // 录制开始
+#define OWL_EVENT_RECORD_STOPPED      0x14  // 录制停止并保存
+#define OWL_EVENT_MODE_CHANGED        0x15  // 模式已切换
 
 /*============================================================================
  *                              错误码定义
@@ -240,6 +256,48 @@ typedef struct __attribute__((packed)) {
 #define OWL_PKT_STATUS_SIZE     sizeof(owl_status_pkt_t)
 #define OWL_PKT_EVENT_SIZE      sizeof(owl_event_pkt_t)
 #define OWL_PKT_ACK_SIZE        sizeof(owl_ack_pkt_t)
+
+/*============================================================================
+ *                              工作模式定义
+ *============================================================================*/
+
+/** 工作模式枚举 */
+typedef enum {
+    OWL_MODE_REMOTE,     // 遥控模式（默认）
+    OWL_MODE_SECURITY,   // 安防模式
+    OWL_MODE_PRESET,     // 预设模式
+    OWL_MODE_RECORD,     // 录制模式（预设模式的子模式）
+} owl_mode_t;
+
+/** 安防子状态枚举 */
+typedef enum {
+    SEC_STATE_SCANNING,  // 巡逻扫描
+    SEC_STATE_DETECTED,  // 检测到入侵
+    SEC_STATE_TRACKING,  // 持续跟踪
+    SEC_STATE_LOST,      // 目标丢失
+} owl_security_state_t;
+
+/** 预设槽位数量 */
+#define OWL_PRESET_SLOT_COUNT   4
+#define OWL_PRESET_MAX_FRAMES   4000   // 每个槽位最大帧数
+#define OWL_PRESET_RECORD_MAX_MS 60000  // 录制最长60秒
+
+/** 预设 NVS 命名空间 */
+#define OWL_PRESETS_NVS_NAMESPACE  "owl_presets"
+
+/** 预设动作帧格式 (8字节) */
+typedef struct __attribute__((packed)) {
+    uint16_t delay_ms;     // 与上一帧的间隔时间 (0-60000ms)
+    uint8_t  servo_x;      // X舵机角度 (0-180, 255=不变)
+    uint8_t  servo_y;      // Y舵机角度 (0-180, 255=不变)
+    uint8_t  relay_flags;  // 继电器状态 (Bit0:灯 Bit1:声 Bit2:炮)
+    uint8_t  reserved[2];  // 保留，填充为0
+} preset_frame_t;
+
+#define OWL_PRESET_FRAME_SIZE  sizeof(preset_frame_t)
+
+/** servo_x/servo_y 不变的标记值 */
+#define OWL_SERVO_NO_CHANGE     255
 
 #ifdef __cplusplus
 }

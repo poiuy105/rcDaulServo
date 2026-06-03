@@ -42,6 +42,12 @@ static int64_t last_heartbeat_time = 0;
 static bool heartbeat_timeout = false;
 
 /*============================================================================
+ *                              工作模式管理
+ *============================================================================*/
+static owl_mode_t g_current_mode = OWL_MODE_REMOTE;
+static uint8_t g_combo_seq = 0;
+
+/*============================================================================
  *                              WS2812 LED 配置
  *============================================================================*/
 
@@ -190,7 +196,27 @@ static void ws2812_pairing_animation(void) {
 
 // LED状态更新函数定义
 static void ws2812_update_connection(bool connected) {
-    ws2812_set_led(LED_CONN, connected ? COLOR_GREEN : COLOR_RED);
+    if (!connected) {
+        ws2812_set_led(LED_CONN, COLOR_RED);  // 红色=未连接
+        return;
+    }
+    switch (g_current_mode) {
+        case OWL_MODE_REMOTE:
+            ws2812_set_led(LED_CONN, COLOR_GREEN);    // 绿色=遥控模式
+            break;
+        case OWL_MODE_SECURITY:
+            ws2812_set_led(LED_CONN, COLOR_RED);       // 红色=安防模式
+            break;
+        case OWL_MODE_PRESET:
+            ws2812_set_led(LED_CONN, COLOR_BLUE);      // 蓝色=预设模式
+            break;
+        case OWL_MODE_RECORD:
+            ws2812_set_led(LED_CONN, COLOR_YELLOW);    // 黄色=录制模式
+            break;
+        default:
+            ws2812_set_led(LED_CONN, COLOR_GREEN);
+            break;
+    }
 }
 
 static void ws2812_update_battery(uint8_t battery_percent) {
@@ -625,6 +651,141 @@ static void send_switch_data(uint8_t sw1, uint8_t sw2) {
                              ESP_GATT_AUTH_REQ_NONE);
 }
 
+/*============================================================================
+ *                              模式切换命令发送
+ *============================================================================*/
+
+static void send_mode_command(uint8_t cmd, uint8_t param) {
+    if (!connect) return;
+    
+    owl_command_pkt_t pkt;
+    pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_COMMAND);
+    pkt.header.seq = g_combo_seq++;
+    pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
+    pkt.cmd = cmd;
+    pkt.param = param;
+    pkt.need_ack = 1;
+    
+    esp_ble_gattc_write_char(gl_profile.gattc_if,
+                               gl_profile.conn_id,
+                               char_control_handle,
+                               sizeof(pkt), (uint8_t*)&pkt,
+                               ESP_GATT_WRITE_NO_RSP);
+    ESP_LOGI(GATTC_TAG, "[模式] 发送命令: 0x%02X param=%d", cmd, param);
+}
+
+// 组合键检测与处理
+static void check_combo_keys(uint8_t switch1, uint8_t switch2) {
+    // 检测组合键：同一帧中两个或以上按键按下
+    uint8_t pressed_count = 0;
+    uint8_t combo = 0;
+    
+    if (switch1 & OWL_SW_UP)    { pressed_count++; combo |= 0x01; }
+    if (switch1 & OWL_SW_DOWN)  { pressed_count++; combo |= 0x02; }
+    if (switch1 & OWL_SW_LEFT)  { pressed_count++; combo |= 0x04; }
+    if (switch1 & OWL_SW_RIGHT) { pressed_count++; combo |= 0x08; }
+    if (switch1 & OWL_SW_CENTER){ pressed_count++; combo |= 0x10; }
+    
+    if (pressed_count < 2) return;  // 不是组合键
+    
+    ESP_LOGI(GATTC_TAG, "[组合键] 检测到: UP=%d DOWN=%d LEFT=%d RIGHT=%d CENTER=%d",
+             (switch1 & OWL_SW_UP) ? 1 : 0,
+             (switch1 & OWL_SW_DOWN) ? 1 : 0,
+             (switch1 & OWL_SW_LEFT) ? 1 : 0,
+             (switch1 & OWL_SW_RIGHT) ? 1 : 0,
+             (switch1 & OWL_SW_CENTER) ? 1 : 0);
+    
+    // 上+下 = 安防模式
+    if ((switch1 & OWL_SW_UP) && (switch1 & OWL_SW_DOWN)) {
+        send_mode_command(OWL_CMD_MODE_SWITCH, OWL_MODE_SECURITY);
+        g_current_mode = OWL_MODE_SECURITY;
+        ws2812_update_connection(true);
+    }
+    // 左+右 = 遥控模式
+    else if ((switch1 & OWL_SW_LEFT) && (switch1 & OWL_SW_RIGHT)) {
+        send_mode_command(OWL_CMD_MODE_SWITCH, OWL_MODE_REMOTE);
+        g_current_mode = OWL_MODE_REMOTE;
+        ws2812_update_connection(true);
+    }
+    // 上+中 = 预设模式
+    else if ((switch1 & OWL_SW_UP) && (switch1 & OWL_SW_CENTER)) {
+        send_mode_command(OWL_CMD_MODE_SWITCH, OWL_MODE_PRESET);
+        g_current_mode = OWL_MODE_PRESET;
+        ws2812_update_connection(true);
+    }
+    // 下+中 = 开始/停止录制
+    else if ((switch1 & OWL_SW_DOWN) && (switch1 & OWL_SW_CENTER)) {
+        if (g_current_mode == OWL_MODE_RECORD) {
+            send_mode_command(OWL_CMD_RECORD_STOP, 0);
+            g_current_mode = OWL_MODE_REMOTE;
+        } else {
+            send_mode_command(OWL_CMD_RECORD_START, 0);
+            g_current_mode = OWL_MODE_RECORD;
+        }
+        ws2812_update_connection(true);
+    }
+    // 左+中 = 执行预设1
+    else if ((switch1 & OWL_SW_LEFT) && (switch1 & OWL_SW_CENTER)) {
+        send_mode_command(OWL_CMD_PRESET_START, 0);
+    }
+    // 右+中 = 执行预设2
+    else if ((switch1 & OWL_SW_RIGHT) && (switch1 & OWL_SW_CENTER)) {
+        send_mode_command(OWL_CMD_PRESET_START, 1);
+    }
+}
+
+// 处理猫头鹰发来的事件包
+static void handle_event_packet(uint8_t *data, uint16_t len) {
+    if (len < 7) return;
+    
+    uint8_t event_type = data[3];  // 跳过3字节header
+    uint8_t p1 = data[4];
+    uint8_t p2 = data[5];
+    uint8_t p3 = data[6];
+    
+    switch (event_type) {
+    case OWL_EVENT_INTRUSION_DETECTED:
+        ESP_LOGW(GATTC_TAG, "[事件] 检测到入侵! 目标数=%d", p3);
+        // LED2闪红色
+        ws2812_set_led(LED_KEY, COLOR_RED);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ws2812_set_led(LED_KEY, COLOR_OFF);
+        break;
+        
+    case OWL_EVENT_INTRUSION_LOST:
+        ESP_LOGI(GATTC_TAG, "[事件] 入侵者消失");
+        break;
+        
+    case OWL_EVENT_PRESET_COMPLETED:
+        ESP_LOGI(GATTC_TAG, "[事件] 预设%d执行完成", p1);
+        g_current_mode = OWL_MODE_REMOTE;
+        ws2812_update_connection(true);
+        break;
+        
+    case OWL_EVENT_RECORD_STARTED:
+        ESP_LOGI(GATTC_TAG, "[事件] 录制开始，槽位%d", p1);
+        g_current_mode = OWL_MODE_RECORD;
+        ws2812_update_connection(true);
+        break;
+        
+    case OWL_EVENT_RECORD_STOPPED:
+        ESP_LOGI(GATTC_TAG, "[事件] 录制停止，保存%d帧到槽位%d", (p2 << 8) | p3, p1);
+        g_current_mode = OWL_MODE_REMOTE;
+        ws2812_update_connection(true);
+        break;
+        
+    case OWL_EVENT_MODE_CHANGED:
+        ESP_LOGI(GATTC_TAG, "[事件] 模式已切换为: %d", p1);
+        g_current_mode = (owl_mode_t)p1;
+        ws2812_update_connection(true);
+        break;
+        
+    default:
+        ESP_LOGI(GATTC_TAG, "[事件] 未知事件: 0x%02X", event_type);
+        break;
+    }
+}
+
 static void send_heartbeat_data(void) {
     owl_heartbeat_pkt_t pkt;
     build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
@@ -683,6 +844,25 @@ static void key_scan_task(void *arg) {
             
             // 按键变化时立即发送
             if (changed && (sw1 != last_sw1 || sw2 != last_sw2)) {
+                // 检测组合键（先于普通发送）
+                check_combo_keys(sw1, sw2);
+                
+                // 如果是组合键，不发送普通switch包
+                uint8_t pressed_count = 0;
+                if (sw1 & OWL_SW_UP) pressed_count++;
+                if (sw1 & OWL_SW_DOWN) pressed_count++;
+                if (sw1 & OWL_SW_LEFT) pressed_count++;
+                if (sw1 & OWL_SW_RIGHT) pressed_count++;
+                if (sw1 & OWL_SW_CENTER) pressed_count++;
+                
+                if (pressed_count >= 2) {
+                    ESP_LOGI(GATTC_TAG, "  组合键，不发送SWITCH包");
+                    vTaskDelay(pdMS_TO_TICKS(300));  // 防抖
+                    continue;
+                }
+                
+                // 发送开关状态
+                ESP_LOGI(GATTC_TAG, "  发送SWITCH包: switch1=0x%02X switch2=0x%02X", sw1, sw2);
                 send_switch_data(sw1, sw2);
                 last_sw1 = sw1;
                 last_sw2 = sw2;
@@ -900,6 +1080,32 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                     xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
                     heartbeat_task_started = true;
                 }
+            }
+        }
+        break;
+        
+    case ESP_GATTC_NOTIFY_EVT:
+        if (param->notify.handle == char_control_handle || param->notify.handle == char_feedback_handle) {
+            uint8_t *p_data = param->notify.value;
+            uint16_t p_data_len = param->notify.value_len;
+            
+            if (p_data_len < 3) break;
+            
+            uint8_t pkt_type = OWL_GET_PKT_TYPE((owl_packet_header_t*)p_data);
+            
+            switch (pkt_type) {
+            case OWL_PKT_RADAR_STATUS:
+                ESP_LOGI(GATTC_TAG, "  [雷达状态] 目标数=%d x=%d y=%d z=%d",
+                         p_data[3], p_data[4], p_data[5], p_data[6]);
+                break;
+            case OWL_PKT_EVENT:
+                handle_event_packet(p_data, p_data_len);
+                break;
+            case OWL_PKT_ACK:
+                ESP_LOGI(GATTC_TAG, "  [ACK] cmd=0x%02X result=%d", p_data[3], p_data[4]);
+                break;
+            default:
+                break;
             }
         }
         break;
