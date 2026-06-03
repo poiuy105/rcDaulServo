@@ -73,6 +73,13 @@ static int64_t g_record_start_time = 0;
 static int64_t g_record_last_frame_time = 0;
 static volatile bool g_recording = false;
 
+/* 前向声明（解决函数顺序依赖） */
+static void preset_stop(void);
+static void record_save(void);
+static uint8_t joystick_to_angle(uint8_t joystick_val);
+static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_t z);
+static uint16_t radar_coord_to_angle(float coord, float gain);
+
 /*============================================================================
  *                              舵机 PWM 配置
  *============================================================================*/
