@@ -868,9 +868,13 @@ static void preset_exit(void) {
         task_to_notify = g_preset_task_handle;
         xSemaphoreGive(g_state_mutex);
     }
-    // 使用任务通知等待任务真正结束（最大等待2秒）
+    // 轮询等待任务真正结束（最大等待2秒）
     if (task_to_notify != NULL) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+        int wait_count = 0;
+        while (g_preset_task_handle != NULL && wait_count < 200) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            wait_count++;
+        }
     }
     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         g_preset_task_handle = NULL;
@@ -905,7 +909,16 @@ static void preset_start(uint8_t slot) {
         g_preset_running = true;
         xSemaphoreGive(g_state_mutex);
     }
-    xTaskCreate(preset_player_task, "preset_player", 4096, NULL, 5, &g_preset_task_handle);
+    BaseType_t ret = xTaskCreate(preset_player_task, "preset_player", 4096, NULL, 5, &g_preset_task_handle);
+    if (ret != pdPASS) {
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_preset_running = false;
+            xSemaphoreGive(g_state_mutex);
+        }
+        ESP_LOGE(GATTS_TAG, "[预设] 任务创建失败");
+        send_ack(OWL_CMD_PRESET_START, OWL_ERR_EXEC_FAILED);
+        return;
+    }
     send_ack(OWL_CMD_PRESET_START, OWL_ERR_NONE);
 }
 
@@ -965,95 +978,85 @@ static void record_exit(void) {
 }
 
 static void record_add_joystick_frame(owl_joystick_pkt_t *pkt) {
-    bool recording = false;
-    preset_frame_t *buf = NULL;
-    uint16_t count = 0;
-    uint16_t capacity = 0;
-    int64_t start_time = 0;
-    int64_t last_frame_time = 0;
-
-    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        recording = g_recording;
-        buf = g_record_buffer;
-        count = g_record_count;
-        capacity = g_record_capacity;
-        start_time = g_record_start_time;
-        last_frame_time = g_record_last_frame_time;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (!g_recording || !g_record_buffer) {
         xSemaphoreGive(g_state_mutex);
-    }
-
-    if (!recording || !buf) return;
-    if (count >= capacity) {
-        ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
-        record_save();
         return;
     }
-    // 检查录制时长
+    if (g_record_count >= g_record_capacity) {
+        bool was_recording = g_recording;
+        g_recording = false;
+        g_record_buffer = NULL;
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
+        if (was_recording) {
+            ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
+            record_save();
+        }
+        return;
+    }
     int64_t now = esp_timer_get_time() / 1000;
-    if ((now - start_time) > OWL_PRESET_RECORD_MAX_MS) {
-        ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
-        record_save();
+    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+        bool was_recording = g_recording;
+        g_recording = false;
+        g_record_buffer = NULL;
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
+        if (was_recording) {
+            ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
+            record_save();
+        }
         return;
     }
-
-    preset_frame_t *f = &buf[count];
-    f->delay_ms = (uint16_t)(now - last_frame_time);
+    // 全部在mutex内完成帧写入
+    preset_frame_t *f = &g_record_buffer[g_record_count];
+    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
     f->servo_x = joystick_to_angle(pkt->x_axis);
     f->servo_y = joystick_to_angle(pkt->y_axis);
-
-    bool light_on = false, sound_on = false, cannon_on = false;
-    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        light_on = relay_light_on;
-        sound_on = relay_sound_on;
-        cannon_on = relay_cannon_on;
-        xSemaphoreGive(g_state_mutex);
-    }
-    f->relay_flags = (light_on ? OWL_RELAY_EYE_LIGHT : 0) |
-                      (sound_on ? OWL_RELAY_SOUND : 0) |
-                      (cannon_on ? OWL_RELAY_CANNON : 0);
+    f->relay_flags = (relay_light_on ? OWL_RELAY_EYE_LIGHT : 0) |
+                      (relay_sound_on ? OWL_RELAY_SOUND : 0) |
+                      (relay_cannon_on ? OWL_RELAY_CANNON : 0);
     f->reserved[0] = 0;
     f->reserved[1] = 0;
-
-    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        g_record_last_frame_time = now;
-        g_record_count = count + 1;
-        xSemaphoreGive(g_state_mutex);
-    }
+    g_record_last_frame_time = now;
+    g_record_count++;
+    xSemaphoreGive(g_state_mutex);
 }
 
 static void record_add_switch_frame(owl_switch_pkt_t *pkt) {
-    bool recording = false;
-    preset_frame_t *buf = NULL;
-    uint16_t count = 0;
-    uint16_t capacity = 0;
-    int64_t start_time = 0;
-    int64_t last_frame_time = 0;
-
-    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        recording = g_recording;
-        buf = g_record_buffer;
-        count = g_record_count;
-        capacity = g_record_capacity;
-        start_time = g_record_start_time;
-        last_frame_time = g_record_last_frame_time;
+    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (!g_recording || !g_record_buffer) {
         xSemaphoreGive(g_state_mutex);
+        return;
     }
-
-    if (!recording || !buf) return;
-    if (count >= capacity) {
-        ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
-        record_save();
+    if (g_record_count >= g_record_capacity) {
+        bool was_recording = g_recording;
+        g_recording = false;
+        g_record_buffer = NULL;
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
+        if (was_recording) {
+            ESP_LOGW(GATTS_TAG, "[录制] 缓冲区满，自动停止");
+            record_save();
+        }
         return;
     }
     int64_t now = esp_timer_get_time() / 1000;
-    if ((now - start_time) > OWL_PRESET_RECORD_MAX_MS) {
-        ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
-        record_save();
+    if ((now - g_record_start_time) > OWL_PRESET_RECORD_MAX_MS) {
+        bool was_recording = g_recording;
+        g_recording = false;
+        g_record_buffer = NULL;
+        g_record_count = 0;
+        xSemaphoreGive(g_state_mutex);
+        if (was_recording) {
+            ESP_LOGW(GATTS_TAG, "[录制] 超时60秒，自动停止");
+            record_save();
+        }
         return;
     }
-
-    preset_frame_t *f = &buf[count];
-    f->delay_ms = (uint16_t)(now - last_frame_time);
+    // 全部在mutex内完成帧写入
+    preset_frame_t *f = &g_record_buffer[g_record_count];
+    f->delay_ms = (uint16_t)(now - g_record_last_frame_time);
     f->servo_x = OWL_SERVO_NO_CHANGE;
     f->servo_y = OWL_SERVO_NO_CHANGE;
     // 记录目标继电器状态（不是变化，而是录制时刻的实际状态）
@@ -1062,12 +1065,9 @@ static void record_add_switch_frame(owl_switch_pkt_t *pkt) {
     if (pkt->switch1 & OWL_SW_DOWN) f->relay_flags |= OWL_RELAY_CANNON;
     f->reserved[0] = 0;
     f->reserved[1] = 0;
-
-    if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        g_record_last_frame_time = now;
-        g_record_count = count + 1;
-        xSemaphoreGive(g_state_mutex);
-    }
+    g_record_last_frame_time = now;
+    g_record_count++;
+    xSemaphoreGive(g_state_mutex);
 }
 
 static void record_save(void) {
@@ -1112,6 +1112,7 @@ static void record_save(void) {
         esp_err_t commit_err = nvs_commit(nvs);
         if (commit_err != ESP_OK) {
             ESP_LOGE(GATTS_TAG, "[录制] NVS commit失败");
+            send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
         } else {
             ESP_LOGI(GATTS_TAG, "[录制] 保存 %d 帧到槽位 %d", local_count, local_slot);
             send_event_notify(OWL_EVENT_RECORD_STOPPED, local_slot,
@@ -1250,12 +1251,12 @@ static uint8_t joystick_to_angle(uint8_t joystick_val) {
 }
 
 static void parse_joystick_packet(owl_joystick_pkt_t *pkt) {
-    ESP_LOGI(GATTS_TAG, "=== JOYSTICK 包 ===");
-    ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
-    ESP_LOGI(GATTS_TAG, "  时间戳: %d", pkt->header.timestamp);
-    ESP_LOGI(GATTS_TAG, "  X轴: %d (0-255, 中点=128)", pkt->x_axis);
-    ESP_LOGI(GATTS_TAG, "  Y轴: %d (0-255, 中点=128)", pkt->y_axis);
-    ESP_LOGI(GATTS_TAG, "  按键: %s", (pkt->button_flags & 0x01) ? "按下" : "松开");
+    ESP_LOGD(GATTS_TAG, "=== JOYSTICK 包 ===");
+    ESP_LOGD(GATTS_TAG, "  序列号: %d", pkt->header.seq);
+    ESP_LOGD(GATTS_TAG, "  时间戳: %d", pkt->header.timestamp);
+    ESP_LOGD(GATTS_TAG, "  X轴: %d (0-255, 中点=128)", pkt->x_axis);
+    ESP_LOGD(GATTS_TAG, "  Y轴: %d (0-255, 中点=128)", pkt->y_axis);
+    ESP_LOGD(GATTS_TAG, "  按键: %s", (pkt->button_flags & 0x01) ? "按下" : "松开");
 
     // 检测丢包（使用回绕安全的序列号比较）
     int8_t seq_diff = (int8_t)(pkt->header.seq - last_seq);
@@ -1275,30 +1276,30 @@ static void parse_joystick_packet(owl_joystick_pkt_t *pkt) {
         if (new_x_angle != servo_x_angle) {
             servo_x_angle = new_x_angle;
             servo_set_angle(LEDC_X_CHANNEL, servo_x_angle);
-            ESP_LOGI(GATTS_TAG, "  -> X舵机更新: %d°", servo_x_angle);
+            ESP_LOGD(GATTS_TAG, "  -> X舵机更新: %d°", servo_x_angle);
         }
 
         if (new_y_angle != servo_y_angle) {
             servo_y_angle = new_y_angle;
             servo_set_angle(LEDC_Y_CHANNEL, servo_y_angle);
-            ESP_LOGI(GATTS_TAG, "  -> Y舵机更新: %d°", servo_y_angle);
+            ESP_LOGD(GATTS_TAG, "  -> Y舵机更新: %d°", servo_y_angle);
         }
         xSemaphoreGive(g_state_mutex);
     }
 }
 
 static void parse_switch_packet(owl_switch_pkt_t *pkt) {
-    ESP_LOGI(GATTS_TAG, "=== SWITCH 包 ===");
-    ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
-    ESP_LOGI(GATTS_TAG, "  开关组1: 0x%02X", pkt->switch1);
-    ESP_LOGI(GATTS_TAG, "    上:%d 下:%d 左:%d 右:%d 中:%d",
+    ESP_LOGD(GATTS_TAG, "=== SWITCH 包 ===");
+    ESP_LOGD(GATTS_TAG, "  序列号: %d", pkt->header.seq);
+    ESP_LOGD(GATTS_TAG, "  开关组1: 0x%02X", pkt->switch1);
+    ESP_LOGD(GATTS_TAG, "    上:%d 下:%d 左:%d 右:%d 中:%d",
              (pkt->switch1 & OWL_SW_UP) ? 1 : 0,
              (pkt->switch1 & OWL_SW_DOWN) ? 1 : 0,
              (pkt->switch1 & OWL_SW_LEFT) ? 1 : 0,
              (pkt->switch1 & OWL_SW_RIGHT) ? 1 : 0,
              (pkt->switch1 & OWL_SW_CENTER) ? 1 : 0);
-    ESP_LOGI(GATTS_TAG, "  开关组2: 0x%02X", pkt->switch2);
-    ESP_LOGI(GATTS_TAG, "    上:%d 下:%d 左:%d 右:%d 中:%d",
+    ESP_LOGD(GATTS_TAG, "  开关组2: 0x%02X", pkt->switch2);
+    ESP_LOGD(GATTS_TAG, "    上:%d 下:%d 左:%d 右:%d 中:%d",
              (pkt->switch2 & OWL_SW_UP) ? 1 : 0,
              (pkt->switch2 & OWL_SW_DOWN) ? 1 : 0,
              (pkt->switch2 & OWL_SW_LEFT) ? 1 : 0,
@@ -1319,31 +1320,31 @@ static void parse_switch_packet(owl_switch_pkt_t *pkt) {
         if (light_on != relay_light_on) {
             relay_light_on = light_on;
             relay_set(RELAY_LIGHT_GPIO, relay_light_on);
-            ESP_LOGI(GATTS_TAG, "  -> 灯光继电器: %s", relay_light_on ? "开" : "关");
+            ESP_LOGD(GATTS_TAG, "  -> 灯光继电器: %s", relay_light_on ? "开" : "关");
         }
 
         // 更新声音继电器
         if (sound_on != relay_sound_on) {
             relay_sound_on = sound_on;
             relay_set(RELAY_SOUND_GPIO, relay_sound_on);
-            ESP_LOGI(GATTS_TAG, "  -> 声音继电器: %s", relay_sound_on ? "开" : "关");
+            ESP_LOGD(GATTS_TAG, "  -> 声音继电器: %s", relay_sound_on ? "开" : "关");
         }
 
         // 更新开炮继电器
         if (cannon_on != relay_cannon_on) {
             relay_cannon_on = cannon_on;
             relay_set(RELAY_CANNON_GPIO, relay_cannon_on);
-            ESP_LOGI(GATTS_TAG, "  -> 开炮继电器: %s", relay_cannon_on ? "开" : "关");
+            ESP_LOGD(GATTS_TAG, "  -> 开炮继电器: %s", relay_cannon_on ? "开" : "关");
         }
         xSemaphoreGive(g_state_mutex);
     }
 }
 
 static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
-    ESP_LOGI(GATTS_TAG, "=== HEARTBEAT 包 ===");
-    ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
-    ESP_LOGI(GATTS_TAG, "  状态: 0x%02X", pkt->status);
-    ESP_LOGI(GATTS_TAG, "  电池: %d.%dV", pkt->battery / 10, pkt->battery % 10);
+    ESP_LOGD(GATTS_TAG, "=== HEARTBEAT 包 ===");
+    ESP_LOGD(GATTS_TAG, "  序列号: %d", pkt->header.seq);
+    ESP_LOGD(GATTS_TAG, "  状态: 0x%02X", pkt->status);
+    ESP_LOGD(GATTS_TAG, "  电池: %d.%dV", pkt->battery / 10, pkt->battery % 10);
 
     // 更新心跳时间
     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1395,11 +1396,11 @@ static bool bg_task_post(bg_task_type_t type, uint8_t param) {
 }
 
 static void parse_command_packet(owl_command_pkt_t *pkt) {
-    ESP_LOGI(GATTS_TAG, "=== COMMAND 包 ===");
-    ESP_LOGI(GATTS_TAG, "  序列号: %d", pkt->header.seq);
-    ESP_LOGI(GATTS_TAG, "  命令码: 0x%02X", pkt->cmd);
-    ESP_LOGI(GATTS_TAG, "  参数: 0x%02X", pkt->param);
-    ESP_LOGI(GATTS_TAG, "  需确认: %s", pkt->need_ack ? "是" : "否");
+    ESP_LOGD(GATTS_TAG, "=== COMMAND 包 ===");
+    ESP_LOGD(GATTS_TAG, "  序列号: %d", pkt->header.seq);
+    ESP_LOGD(GATTS_TAG, "  命令码: 0x%02X", pkt->cmd);
+    ESP_LOGD(GATTS_TAG, "  参数: 0x%02X", pkt->param);
+    ESP_LOGD(GATTS_TAG, "  需确认: %s", pkt->need_ack ? "是" : "否");
 
     // 通用参数范围校验
     if (pkt->param > 0x7F) {
@@ -1412,7 +1413,10 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
         // 工作模式命令
         case OWL_CMD_MODE_SWITCH:
             if (pkt->param <= OWL_MODE_RECORD) {
-                bg_task_post(BG_TASK_MODE_SWITCH, pkt->param);
+                if (!bg_task_post(BG_TASK_MODE_SWITCH, pkt->param)) {
+                    send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_EXEC_FAILED);
+                    break;
+                }
                 send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_NONE);
             } else {
                 send_ack(OWL_CMD_MODE_SWITCH, OWL_ERR_INVALID_CMD);
@@ -1424,11 +1428,17 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
                 send_ack(OWL_CMD_PRESET_START, OWL_ERR_INVALID_CMD);
                 break;
             }
-            bg_task_post(BG_TASK_PRESET_START, pkt->param);
+            if (!bg_task_post(BG_TASK_PRESET_START, pkt->param)) {
+                send_ack(OWL_CMD_PRESET_START, OWL_ERR_EXEC_FAILED);
+                break;
+            }
             break;
 
         case OWL_CMD_PRESET_STOP:
-            bg_task_post(BG_TASK_PRESET_STOP, 0);
+            if (!bg_task_post(BG_TASK_PRESET_STOP, 0)) {
+                send_ack(OWL_CMD_PRESET_STOP, OWL_ERR_EXEC_FAILED);
+                break;
+            }
             break;
 
         case OWL_CMD_RECORD_START:
@@ -1436,11 +1446,17 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
                 send_ack(OWL_CMD_RECORD_START, OWL_ERR_INVALID_CMD);
                 break;
             }
-            bg_task_post(BG_TASK_RECORD_START, pkt->param);
+            if (!bg_task_post(BG_TASK_RECORD_START, pkt->param)) {
+                send_ack(OWL_CMD_RECORD_START, OWL_ERR_EXEC_FAILED);
+                break;
+            }
             break;
 
         case OWL_CMD_RECORD_STOP:
-            bg_task_post(BG_TASK_RECORD_STOP, 0);
+            if (!bg_task_post(BG_TASK_RECORD_STOP, 0)) {
+                send_ack(OWL_CMD_RECORD_STOP, OWL_ERR_EXEC_FAILED);
+                break;
+            }
             break;
 
         case OWL_CMD_RECORD_DELETE:
@@ -1448,7 +1464,10 @@ static void parse_command_packet(owl_command_pkt_t *pkt) {
                 send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_INVALID_CMD);
                 break;
             }
-            bg_task_post(BG_TASK_RECORD_DELETE, pkt->param);
+            if (!bg_task_post(BG_TASK_RECORD_DELETE, pkt->param)) {
+                send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_EXEC_FAILED);
+                break;
+            }
             break;
 
         // 原有命令
@@ -1698,6 +1717,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         ESP_LOGI(GATTS_TAG, "客户端断开, reason=0x%02x", param->disconnect.reason);
         esp_ble_gap_start_advertising(&adv_params);
         local_mtu = 23;
+        gl_profile.conn_id = 0;
         if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             last_seq = 0;
             last_heartbeat_time = 0;

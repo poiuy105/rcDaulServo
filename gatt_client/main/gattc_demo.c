@@ -43,7 +43,7 @@ static volatile bool heartbeat_timeout = false;
 /*============================================================================
  *                              工作模式管理
  *============================================================================*/
-static owl_mode_t g_current_mode = OWL_MODE_REMOTE;
+static volatile owl_mode_t g_current_mode = OWL_MODE_REMOTE;
 
 /*============================================================================
  *                              WS2812 LED 配置
@@ -306,17 +306,17 @@ static void joystick_adc_init(void) {
 
 // 读取摇杆值
 static void joystick_read(uint8_t *x, uint8_t *y, uint8_t *btn) {
-    int raw_x = 0, raw_y = 0;
-    
-    // 读取ADC原始值 (0-4095)
-    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOYSTICK_X_CHANNEL, &raw_x));
-    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, JOYSTICK_Y_CHANNEL, &raw_y));
-    
-    // 映射到0-255
+    int raw_x = 2048, raw_y = 2048;  // 默认中点值
+
+    if (adc_oneshot_read(adc_handle, JOYSTICK_X_CHANNEL, &raw_x) != ESP_OK) {
+        raw_x = 2048;
+    }
+    if (adc_oneshot_read(adc_handle, JOYSTICK_Y_CHANNEL, &raw_y) != ESP_OK) {
+        raw_y = 2048;
+    }
+
     *x = (uint8_t)((raw_x * 255) / 4095);
     *y = (uint8_t)((raw_y * 255) / 4095);
-    
-    // 读取按键（按下为低电平）
     *btn = (gpio_get_level(JOYSTICK_BTN_GPIO) == 0) ? 1 : 0;
 }
 
@@ -646,8 +646,8 @@ static void send_joystick_data(void) {
     // 发送摇杆数据
     owl_joystick_pkt_t pkt;
     build_joystick_packet(&pkt, x, y, btn);
-    ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
-    ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
+    ESP_LOGD(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
+    ESP_LOGD(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
     BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
                    char_control_handle, &pkt, sizeof(pkt),
                    ESP_GATT_WRITE_TYPE_NO_RSP);
@@ -656,8 +656,8 @@ static void send_joystick_data(void) {
 static void send_switch_data(uint8_t sw1, uint8_t sw2) {
     owl_switch_pkt_t pkt;
     build_switch_packet(&pkt, sw1, sw2);
-    ESP_LOGI(GATTC_TAG, ">>> 发送 SWITCH 包 (矩阵按键)");
-    ESP_LOGI(GATTC_TAG, "    开关1=0x%02X, 开关2=0x%02X", pkt.switch1, pkt.switch2);
+    ESP_LOGD(GATTC_TAG, ">>> 发送 SWITCH 包 (矩阵按键)");
+    ESP_LOGD(GATTC_TAG, "    开关1=0x%02X, 开关2=0x%02X", pkt.switch1, pkt.switch2);
     BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
                    char_control_handle, &pkt, sizeof(pkt),
                    ESP_GATT_WRITE_TYPE_NO_RSP);
@@ -669,15 +669,8 @@ static void send_switch_data(uint8_t sw1, uint8_t sw2) {
 
 static void send_mode_command(uint8_t cmd, uint8_t param) {
     if (!connect) return;
-    
     owl_command_pkt_t pkt;
-    pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_COMMAND);
-    pkt.header.seq = seq_command++;
-    pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
-    pkt.cmd = cmd;
-    pkt.param = param;
-    pkt.need_ack = 1;
-    
+    build_command_packet(&pkt, cmd, param, 1);
     BLE_WRITE_CHAR(gl_profile.gattc_if,
                    gl_profile.conn_id,
                    char_control_handle,
@@ -800,8 +793,8 @@ static void handle_event_packet(uint8_t *data, uint16_t len) {
 static void send_heartbeat_data(void) {
     owl_heartbeat_pkt_t pkt;
     build_heartbeat_packet(&pkt, 0x00, 37);  // 正常状态，3.7V
-    ESP_LOGI(GATTC_TAG, ">>> 发送 HEARTBEAT 包");
-    ESP_LOGI(GATTC_TAG, "    状态=0x%02X, 电池=%d.%dV", pkt.status, pkt.battery/10, pkt.battery%10);
+    ESP_LOGD(GATTC_TAG, ">>> 发送 HEARTBEAT 包");
+    ESP_LOGD(GATTC_TAG, "    状态=0x%02X, 电池=%d.%dV", pkt.status, pkt.battery/10, pkt.battery%10);
     BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
                    char_control_handle, &pkt, sizeof(pkt),
                    ESP_GATT_WRITE_TYPE_NO_RSP);
@@ -822,6 +815,7 @@ static void key_scan_task(void *arg) {
     uint8_t last_btn = 0;
     uint8_t combo_cooldown = 0;  // 组合键冷却计数器（防止连续触发）
     uint8_t joystick_send_counter = 0;  // 摇杆发送计数器（每50次=500ms发一次）
+    static uint8_t comm_led_counter = 0;
     
     while (1) {
         if (connect && char_control_handle != INVALID_HANDLE) {
@@ -866,8 +860,7 @@ static void key_scan_task(void *arg) {
                     
                     // 通信LED闪烁
                     ws2812_update_comm(true);
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    ws2812_update_comm(false);
+                    comm_led_counter = 5;  // 50ms后自动关闭 (5次×10ms)
                 }
             }
             
@@ -878,6 +871,11 @@ static void key_scan_task(void *arg) {
             
             // 冷却计数器递减
             if (combo_cooldown > 0) combo_cooldown--;
+        }
+        
+        if (comm_led_counter > 0) {
+            comm_led_counter--;
+            if (comm_led_counter == 0) ws2812_update_comm(false);
         }
         
         // 10ms扫描一次
@@ -936,7 +934,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                                                  ESP_BLE_AD_TYPE_NAME_CMPL,
                                                  &adv_name_len);
             
-            if (adv_name != NULL && strncmp((char*)adv_name, target_device_name, adv_name_len) == 0) {
+            if (adv_name != NULL) {
+                size_t target_len = strlen(target_device_name);
+                if (adv_name_len == target_len &&
+                    strncmp((char*)adv_name, target_device_name, target_len) == 0) {
                 ESP_LOGI(GATTC_TAG, "发现目标设备: %s", target_device_name);
                 ESP_LOGI(GATTC_TAG, "地址: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->scan_rst.bda));
                 
@@ -955,6 +956,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 // 停止扫描并连接
                 esp_ble_gap_stop_scanning();
                 esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
+                }
             }
         }
         break;
@@ -1121,8 +1123,18 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                     .arg = NULL,
                     .name = "test_timer"
                 };
-                esp_timer_create(&timer_args, &test_timer);
-                esp_timer_start_periodic(test_timer, 500000);  // 每 500ms 发送一次
+                esp_err_t timer_ret = esp_timer_create(&timer_args, &test_timer);
+                if (timer_ret != ESP_OK) {
+                    ESP_LOGE(GATTC_TAG, "定时器创建失败: %s", esp_err_to_name(timer_ret));
+                    test_timer = NULL;
+                } else {
+                    timer_ret = esp_timer_start_periodic(test_timer, 500000);
+                    if (timer_ret != ESP_OK) {
+                        ESP_LOGE(GATTC_TAG, "定时器启动失败: %s", esp_err_to_name(timer_ret));
+                        esp_timer_delete(test_timer);
+                        test_timer = NULL;
+                    }
+                }
                 
                 // 启动按键扫描任务（只启动一次）
                 static bool key_task_started = false;
@@ -1155,14 +1167,18 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
             
             switch (pkt_type) {
             case OWL_PKT_RADAR_STATUS:
-                ESP_LOGI(GATTC_TAG, "  [雷达状态] 目标数=%d x=%d y=%d z=%d",
-                         p_data[3], p_data[4], p_data[5], p_data[6]);
+                if (p_data_len >= 7) {
+                    ESP_LOGI(GATTC_TAG, "  [雷达状态] 目标数=%d x=%d y=%d z=%d",
+                             p_data[3], p_data[4], p_data[5], p_data[6]);
+                }
                 break;
             case OWL_PKT_EVENT:
                 handle_event_packet(p_data, p_data_len);
                 break;
             case OWL_PKT_ACK:
-                ESP_LOGI(GATTC_TAG, "  [ACK] cmd=0x%02X result=%d", p_data[3], p_data[4]);
+                if (p_data_len >= sizeof(owl_ack_pkt_t)) {
+                    ESP_LOGI(GATTC_TAG, "  [ACK] cmd=0x%02X result=%d", p_data[3], p_data[4]);
+                }
                 break;
             default:
                 break;
