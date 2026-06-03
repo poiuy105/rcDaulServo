@@ -670,7 +670,8 @@ static void send_mode_command(uint8_t cmd, uint8_t param) {
                                gl_profile.conn_id,
                                char_control_handle,
                                sizeof(pkt), (uint8_t*)&pkt,
-                               ESP_GATT_WRITE_NO_RSP);
+                               ESP_GATT_WRITE_TYPE_NO_RSP,
+                               ESP_GATT_AUTH_REQ_NONE);
     ESP_LOGI(GATTC_TAG, "[模式] 发送命令: 0x%02X param=%d", cmd, param);
 }
 
