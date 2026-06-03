@@ -224,7 +224,10 @@ static void heartbeat_monitor_task(void *arg) {
                 ESP_LOGW(GATTS_TAG, "心跳超时！客户端可能已断线");
                 // 主动断开连接，让客户端重新连接
                 if (local_conn_id > 0) {
-                    esp_ble_gatts_close(local_gatts_if, local_conn_id);
+                    esp_gatt_status_t close_rc = esp_ble_gatts_close(local_gatts_if, local_conn_id);
+                    if (close_rc != ESP_GATT_OK) {
+                        ESP_LOGW(GATTS_TAG, "关闭连接失败: 0x%x", close_rc);
+                    }
                 }
                 if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     last_heartbeat_time = 0;
@@ -307,13 +310,16 @@ static void clear_bound_mac(void) {
         esp_err_t commit_err = nvs_commit(nvs_handle);
         if (commit_err != ESP_OK) {
             ESP_LOGE(GATTS_TAG, "NVS commit失败: %s", esp_err_to_name(commit_err));
+        } else {
+            g_is_bound = false;
+            memset(g_bound_mac, 0, 6);
+            ESP_LOGI(GATTS_TAG, "绑定信息已清除");
         }
+    } else {
+        ESP_LOGE(GATTS_TAG, "NVS擦除失败: %s", esp_err_to_name(err));
     }
-    
+
     nvs_close(nvs_handle);
-    g_is_bound = false;
-    memset(g_bound_mac, 0, 6);
-    ESP_LOGI(GATTS_TAG, "绑定信息已清除");
 }
 
 // 验证 MAC 地址
@@ -488,10 +494,13 @@ static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_
     memcpy(&pkt[6], &y, 2);  // y (LE)
     memcpy(&pkt[8], &z, 2);  // z (LE)
 
-    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+    esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
                                  gl_profile.descr_feedback_handle,
                                  sizeof(pkt), pkt, false);
+    if (rc != ESP_GATT_OK) {
+        ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
+    }
 }
 
 /*============================================================================
@@ -507,18 +516,17 @@ static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_
     pkt.header.seq = feedback_seq++;
     pkt.header.timestamp = (uint8_t)(esp_log_timestamp() & 0xFF);
     pkt.event_type = event_code;
-    pkt.event_param = p1;
+    pkt.p1 = p1;
+    pkt.p2 = p2;
+    pkt.p3 = p3;
     
-    // 使用原始Notify发送7字节（header 3字节 + event_type + event_param + 2 extra bytes）
-    uint8_t buf[7];
-    memcpy(buf, &pkt, sizeof(owl_event_pkt_t));
-    buf[5] = p2;
-    buf[6] = p3;
-    
-    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+    esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
                                  gl_profile.descr_feedback_handle,
-                                 sizeof(buf), buf, false);
+                                 sizeof(pkt), (uint8_t*)&pkt, false);
+    if (rc != ESP_GATT_OK) {
+        ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
+    }
 }
 
 // 发送ACK包
@@ -533,10 +541,13 @@ static void send_ack(uint8_t cmd, uint8_t result) {
     pkt.result = result;
     pkt.data = 0;
     
-    esp_ble_gatts_send_indicate(gl_profile.gatts_if,
+    esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
                                  gl_profile.descr_feedback_handle,
                                  sizeof(pkt), (uint8_t*)&pkt, false);
+    if (rc != ESP_GATT_OK) {
+        ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
+    }
 }
 
 /*============================================================================
@@ -785,7 +796,15 @@ static void preset_player_task(void *arg) {
         return;
     }
 
-    nvs_get_blob(nvs, key, frames, &blob_len);
+    err = nvs_get_blob(nvs, key, frames, &blob_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "[预设] 读取帧数据失败: %s", esp_err_to_name(err));
+        free(frames);
+        nvs_close(nvs);
+        send_event_notify(OWL_EVENT_PRESET_COMPLETED, local_slot, 0, 0);
+        send_ack(OWL_CMD_PRESET_START, OWL_ERR_EXEC_FAILED);
+        return;
+    }
     nvs_close(nvs);
 
     ESP_LOGI(GATTS_TAG, "[预设] 读取到 %d 帧数据", frame_count);
@@ -1138,7 +1157,16 @@ static void record_delete(uint8_t slot) {
 
     char key[16];
     snprintf(key, sizeof(key), "preset_%d", slot);
-    nvs_erase_key(nvs, key);
+    esp_err_t erase_err = nvs_erase_key(nvs, key);
+    if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(GATTS_TAG, "[录制] 删除失败: %s", esp_err_to_name(erase_err));
+        nvs_close(nvs);
+        send_ack(OWL_CMD_RECORD_DELETE, OWL_ERR_EXEC_FAILED);
+        return;
+    }
+    if (erase_err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(GATTS_TAG, "[录制] 槽位%d本无数据", slot);
+    }
     esp_err_t commit_err = nvs_commit(nvs);
     if (commit_err != ESP_OK) {
         ESP_LOGE(GATTS_TAG, "[录制] NVS commit失败");
@@ -1613,21 +1641,32 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         gl_profile.service_id.id.inst_id = 0x00;
         gl_profile.service_id.id.uuid.len = ESP_UUID_LEN_16;
         gl_profile.service_id.id.uuid.uuid.uuid16 = OWL_SERVICE_UUID;
-        esp_ble_gatts_create_service(gatts_if, &gl_profile.service_id, GATTS_NUM_HANDLE);
+        esp_gatt_status_t ret = esp_ble_gatts_create_service(gatts_if, &gl_profile.service_id, GATTS_NUM_HANDLE);
+        if (ret != ESP_GATT_OK) {
+            ESP_LOGE(GATTS_TAG, "创建服务失败: %d", ret);
+            break;
+        }
         break;
         
     case ESP_GATTS_CREATE_EVT:
         ESP_LOGI(GATTS_TAG, "服务创建成功, handle=%d", param->create.service_handle);
         gl_profile.service_handle = param->create.service_handle;
-        esp_ble_gatts_start_service(gl_profile.service_handle);
+        ret = esp_ble_gatts_start_service(gl_profile.service_handle);
+        if (ret != ESP_GATT_OK) {
+            ESP_LOGE(GATTS_TAG, "启动服务失败: %d", ret);
+            break;
+        }
         
         // 添加控制通道特征值 (Write Without Response)
         {
             esp_bt_uuid_t char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = OWL_CHAR_CONTROL_UUID};
-            esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
+            ret = esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
                                    ESP_GATT_PERM_WRITE,
                                    ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR,
                                    NULL, NULL);
+            if (ret != ESP_GATT_OK) {
+                ESP_LOGE(GATTS_TAG, "添加控制通道特征值失败: %d", ret);
+            }
         }
         break;
         
@@ -1640,18 +1679,24 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             
             // 添加反馈通道特征值 (Notify)
             esp_bt_uuid_t char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = OWL_CHAR_FEEDBACK_UUID};
-            esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
+            ret = esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
                                    ESP_GATT_PERM_READ,
                                    ESP_GATT_CHAR_PROP_BIT_NOTIFY,
                                    NULL, NULL);
+            if (ret != ESP_GATT_OK) {
+                ESP_LOGE(GATTS_TAG, "添加反馈通道特征值失败: %d", ret);
+            }
         }
         else if (param->add_char.char_uuid.uuid.uuid16 == OWL_CHAR_FEEDBACK_UUID) {
             gl_profile.char_feedback_handle = param->add_char.attr_handle;
             
             // 添加 CCC 描述符
             esp_bt_uuid_t descr_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG};
-            esp_ble_gatts_add_char_descr(gl_profile.service_handle, &descr_uuid,
+            ret = esp_ble_gatts_add_char_descr(gl_profile.service_handle, &descr_uuid,
                                          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+            if (ret != ESP_GATT_OK) {
+                ESP_LOGE(GATTS_TAG, "添加描述符失败: %d", ret);
+            }
         }
         break;
         
@@ -1662,10 +1707,13 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         // 添加系统命令特征值 (Write + Indicate)
         {
             esp_bt_uuid_t char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = OWL_CHAR_COMMAND_UUID};
-            esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
+            ret = esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
                                    ESP_GATT_PERM_WRITE,
                                    ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_INDICATE,
                                    NULL, NULL);
+            if (ret != ESP_GATT_OK) {
+                ESP_LOGE(GATTS_TAG, "添加命令通道特征值失败: %d", ret);
+            }
         }
         break;
         

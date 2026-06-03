@@ -192,12 +192,14 @@ typedef struct __attribute__((packed)) {
 
 /**
  * @brief 事件通知数据包 (类型 0x82)
- * @note 总长度: 5 bytes
+ * @note 总长度: 7 bytes (header 3 + event_type 1 + p1 1 + p2 1 + p3 1)
  */
 typedef struct __attribute__((packed)) {
     owl_packet_header_t header;
     uint8_t event_type;     // 事件类型
-    uint8_t event_param;    // 事件参数
+    uint8_t p1;             // 参数1 (如: 槽位号、模式值)
+    uint8_t p2;             // 参数2 (如: 帧数高字节)
+    uint8_t p3;             // 参数3 (如: 帧数低字节、目标数)
 } owl_event_pkt_t;
 
 /**

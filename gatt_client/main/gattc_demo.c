@@ -481,8 +481,8 @@ static volatile int64_t last_recv_time = 0;
  *============================================================================*/
 
 // 绑定状态
-static bool g_is_bound = false;
-static uint8_t g_bound_mac[6] = {0};
+static volatile bool g_is_bound = false;
+static volatile uint8_t g_bound_mac[6] = {0};
 
 // 加载绑定的 MAC 地址
 static void load_bound_mac(void) {
@@ -497,10 +497,12 @@ static void load_bound_mac(void) {
         return;
     }
     
-    err = nvs_get_blob(nvs_handle, OWL_KEY_REMOTE_MAC, g_bound_mac, &length);
+    uint8_t tmp_mac[6] = {0};
+    err = nvs_get_blob(nvs_handle, OWL_KEY_REMOTE_MAC, tmp_mac, &length);
     if (err == ESP_OK && length == 6) {
+        memcpy((void*)g_bound_mac, tmp_mac, 6);
         g_is_bound = true;
-        ESP_LOGI(GATTC_TAG, "已绑定猫头鹰 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(g_bound_mac));
+        ESP_LOGI(GATTC_TAG, "已绑定猫头鹰 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(tmp_mac));
     } else {
         g_is_bound = false;
         ESP_LOGI(GATTC_TAG, "无绑定信息，将自动绑定首个连接的设备");
@@ -521,10 +523,14 @@ static void save_bound_mac(uint8_t *mac) {
     }
     
     err = nvs_set_blob(nvs_handle, OWL_KEY_REMOTE_MAC, mac, 6);
-    if (err == ESP_OK) {
+    if (err != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "MAC保存失败: %s", esp_err_to_name(err));
+    } else {
         err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            memcpy(g_bound_mac, mac, 6);
+        if (err != ESP_OK) {
+            ESP_LOGE(GATTC_TAG, "MAC commit失败: %s", esp_err_to_name(err));
+        } else {
+            memcpy((void*)g_bound_mac, mac, 6);  // volatile写入
             g_is_bound = true;
             ESP_LOGI(GATTC_TAG, "猫头鹰 MAC 已保存: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(mac));
         }
@@ -543,12 +549,15 @@ static void clear_bound_mac(void) {
     
     err = nvs_erase_key(nvs_handle, OWL_KEY_REMOTE_MAC);
     if (err == ESP_OK) {
-        nvs_commit(nvs_handle);
+        esp_err_t commit_err = nvs_commit(nvs_handle);
+        if (commit_err != ESP_OK) {
+            ESP_LOGE(GATTC_TAG, "NVS commit失败: %s", esp_err_to_name(commit_err));
+        }
     }
     
     nvs_close(nvs_handle);
     g_is_bound = false;
-    memset(g_bound_mac, 0, 6);
+    memset((void*)g_bound_mac, 0, 6);
     ESP_LOGI(GATTC_TAG, "绑定信息已清除");
 }
 
@@ -741,16 +750,13 @@ static void check_combo_keys(uint8_t switch1, uint8_t switch2) {
 
 // 处理猫头鹰发来的事件包（非阻塞，仅更新状态）
 static void handle_event_packet(uint8_t *data, uint16_t len) {
-    if (len < 7) return;
+    if (len < sizeof(owl_event_pkt_t)) return;
     
-    uint8_t event_type = data[3];  // 跳过3字节header
-    uint8_t p1 = data[4];
-    uint8_t p2 = data[5];
-    uint8_t p3 = data[6];
+    owl_event_pkt_t *evt = (owl_event_pkt_t*)data;
     
-    switch (event_type) {
+    switch (evt->event_type) {
     case OWL_EVENT_INTRUSION_DETECTED:
-        ESP_LOGW(GATTC_TAG, "[事件] 检测到入侵! 目标数=%d", p3);
+        ESP_LOGW(GATTC_TAG, "[事件] 检测到入侵! 目标数=%d", evt->p3);
         // LED2闪红色（非阻塞：仅设置颜色，由主循环管理闪烁时序）
         ws2812_set_led(LED_KEY, COLOR_RED);
         break;
@@ -761,31 +767,35 @@ static void handle_event_packet(uint8_t *data, uint16_t len) {
         break;
         
     case OWL_EVENT_PRESET_COMPLETED:
-        ESP_LOGI(GATTC_TAG, "[事件] 预设%d执行完成", p1);
+        ESP_LOGI(GATTC_TAG, "[事件] 预设%d执行完成", evt->p1);
         g_current_mode = OWL_MODE_REMOTE;
         ws2812_update_connection(true);
         break;
         
     case OWL_EVENT_RECORD_STARTED:
-        ESP_LOGI(GATTC_TAG, "[事件] 录制开始，槽位%d", p1);
+        ESP_LOGI(GATTC_TAG, "[事件] 录制开始，槽位%d", evt->p1);
         g_current_mode = OWL_MODE_RECORD;
         ws2812_update_connection(true);
         break;
         
     case OWL_EVENT_RECORD_STOPPED:
-        ESP_LOGI(GATTC_TAG, "[事件] 录制停止，保存%d帧到槽位%d", (p2 << 8) | p3, p1);
+        ESP_LOGI(GATTC_TAG, "[事件] 录制停止，保存%d帧到槽位%d", (evt->p2 << 8) | evt->p3, evt->p1);
         g_current_mode = OWL_MODE_REMOTE;
         ws2812_update_connection(true);
         break;
         
     case OWL_EVENT_MODE_CHANGED:
-        ESP_LOGI(GATTC_TAG, "[事件] 模式已切换为: %d", p1);
-        g_current_mode = (owl_mode_t)p1;
+        if (evt->p1 <= OWL_MODE_RECORD) {
+            ESP_LOGI(GATTC_TAG, "[事件] 模式已切换为: %d", evt->p1);
+            g_current_mode = (owl_mode_t)evt->p1;
+        } else {
+            ESP_LOGW(GATTC_TAG, "[事件] 无效模式值: %d", evt->p1);
+        }
         ws2812_update_connection(true);
         break;
         
     default:
-        ESP_LOGI(GATTC_TAG, "[事件] 未知事件: 0x%02X", event_type);
+        ESP_LOGI(GATTC_TAG, "[事件] 未知事件: 0x%02X", evt->event_type);
         break;
     }
 }
@@ -943,7 +953,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 
                 // 检查是否已绑定该设备
                 if (g_is_bound) {
-                    if (memcmp(param->scan_rst.bda, g_bound_mac, 6) == 0) {
+                    if (memcmp(param->scan_rst.bda, (const void*)g_bound_mac, 6) == 0) {
                         ESP_LOGI(GATTC_TAG, "✅ 发现已绑定的猫头鹰，准备连接");
                     } else {
                         ESP_LOGW(GATTC_TAG, "⚠️ 发现其他猫头鹰，跳过 (已绑定其他设备)");
@@ -955,7 +965,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                 
                 // 停止扫描并连接
                 esp_ble_gap_stop_scanning();
-                esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
+                esp_gatt_status_t open_ret = esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
+                if (open_ret != ESP_GATT_OK) {
+                    ESP_LOGE(GATTC_TAG, "连接请求失败: 0x%x", open_ret);
+                }
                 }
             }
         }
@@ -967,6 +980,122 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         
     default:
         break;
+    }
+}
+
+/*============================================================================
+ *                              GATT 特征值发现与连接任务
+ *============================================================================*/
+
+static void discover_all_characteristics(void) {
+    esp_gattc_char_elem_t *char_elem = NULL;
+    uint16_t count = 0;
+    esp_bt_uuid_t char_uuid;
+
+    esp_ble_gattc_get_attr_count(gl_profile.gattc_if, gl_profile.conn_id,
+                                 ESP_GATT_DB_CHARACTERISTIC,
+                                 gl_profile.service_start_handle,
+                                 gl_profile.service_end_handle,
+                                 INVALID_HANDLE, &count);
+
+    if (count == 0) return;
+
+    char_elem = (esp_gattc_char_elem_t*)malloc(sizeof(esp_gattc_char_elem_t) * count);
+    if (!char_elem) return;
+
+    char_uuid.len = ESP_UUID_LEN_16;
+
+    // 控制通道
+    char_uuid.uuid.uuid16 = REMOTE_CHAR_CONTROL_UUID;
+    uint16_t cnt = count;
+    if (esp_ble_gattc_get_char_by_uuid(gl_profile.gattc_if, gl_profile.conn_id,
+            gl_profile.service_start_handle, gl_profile.service_end_handle,
+            char_uuid, char_elem, &cnt) == ESP_GATT_OK && cnt > 0) {
+        char_control_handle = char_elem[0].char_handle;
+        ESP_LOGI(GATTC_TAG, "控制通道特征值: handle=%d", char_control_handle);
+    }
+
+    // 反馈通道
+    char_uuid.uuid.uuid16 = REMOTE_CHAR_FEEDBACK_UUID;
+    cnt = count;
+    if (esp_ble_gattc_get_char_by_uuid(gl_profile.gattc_if, gl_profile.conn_id,
+            gl_profile.service_start_handle, gl_profile.service_end_handle,
+            char_uuid, char_elem, &cnt) == ESP_GATT_OK && cnt > 0) {
+        char_feedback_handle = char_elem[0].char_handle;
+        ESP_LOGI(GATTC_TAG, "反馈通道特征值: handle=%d", char_feedback_handle);
+
+        // 获取CCC并注册Notify
+        esp_gattc_descr_elem_t *descr = (esp_gattc_descr_elem_t*)malloc(sizeof(esp_gattc_descr_elem_t) * 2);
+        if (descr) {
+            uint16_t d_cnt = 2;
+            esp_bt_uuid_t ccc_uuid = { .len = ESP_UUID_LEN_16, .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG };
+            if (esp_ble_gattc_get_descr_by_char_handle(gl_profile.gattc_if, gl_profile.conn_id,
+                    char_feedback_handle, ccc_uuid, descr, &d_cnt) == ESP_GATT_OK && d_cnt > 0) {
+                char_feedback_ccc_handle = descr[0].handle;
+                uint8_t notify_val[2] = {0x01, 0x00};
+                esp_ble_gattc_write_char_descr(gl_profile.gattc_if, gl_profile.conn_id,
+                    char_feedback_ccc_handle, sizeof(notify_val), notify_val,
+                    ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+                ESP_LOGI(GATTC_TAG, "已注册Notify (CCC handle=%d)", char_feedback_ccc_handle);
+            }
+            free(descr);
+        }
+    }
+
+    // 命令通道
+    char_uuid.uuid.uuid16 = REMOTE_CHAR_COMMAND_UUID;
+    cnt = count;
+    if (esp_ble_gattc_get_char_by_uuid(gl_profile.gattc_if, gl_profile.conn_id,
+            gl_profile.service_start_handle, gl_profile.service_end_handle,
+            char_uuid, char_elem, &cnt) == ESP_GATT_OK && cnt > 0) {
+        char_command_handle = char_elem[0].char_handle;
+        ESP_LOGI(GATTC_TAG, "系统命令特征值: handle=%d", char_command_handle);
+    }
+
+    free(char_elem);
+}
+
+static void start_connection_tasks(void) {
+    // 初始化接收时间
+    last_recv_time = esp_timer_get_time() / 1000;
+    heartbeat_timeout = false;
+
+    // 更新LED状态
+    ws2812_update_connection(true);
+    ws2812_update_battery(70);
+    ws2812_pairing_animation();
+
+    // 创建定时器
+    esp_timer_create_args_t timer_args = {
+        .callback = send_test_data,
+        .arg = NULL,
+        .name = "test_timer"
+    };
+    esp_err_t timer_ret = esp_timer_create(&timer_args, &test_timer);
+    if (timer_ret != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "定时器创建失败: %s", esp_err_to_name(timer_ret));
+        test_timer = NULL;
+    } else {
+        timer_ret = esp_timer_start_periodic(test_timer, 500000);
+        if (timer_ret != ESP_OK) {
+            ESP_LOGE(GATTC_TAG, "定时器启动失败: %s", esp_err_to_name(timer_ret));
+            esp_timer_delete(test_timer);
+            test_timer = NULL;
+        }
+    }
+
+    // 启动按键扫描任务（只启动一次）
+    static bool key_task_started = false;
+    if (!key_task_started) {
+        xTaskCreate(key_scan_task, "key_scan", 2048, NULL, 5, NULL);
+        key_task_started = true;
+    }
+
+    // 启动心跳检测任务（只启动一次）
+    static bool heartbeat_task_started = false;
+    if (!heartbeat_task_started) {
+        xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
+        heartbeat_task_started = true;
     }
 }
 
@@ -1017,138 +1146,11 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         
     case ESP_GATTC_SEARCH_CMPL_EVT:
         if (get_server) {
-            // 获取特征值
-            esp_gattc_char_elem_t *char_elem_result = NULL;
-            uint16_t count = 0;
-            esp_bt_uuid_t char_uuid;
-            
-            // 先获取特征值数量
-            esp_ble_gattc_get_attr_count(gl_profile.gattc_if, gl_profile.conn_id,
-                                         ESP_GATT_DB_CHARACTERISTIC,
-                                         gl_profile.service_start_handle,
-                                         gl_profile.service_end_handle,
-                                         INVALID_HANDLE, &count);
-            
-            if (count > 0) {
-                char_elem_result = (esp_gattc_char_elem_t*)malloc(sizeof(esp_gattc_char_elem_t) * count);
-                if (char_elem_result) {
-                    // 获取控制通道特征值
-                    char_uuid.len = ESP_UUID_LEN_16;
-                    char_uuid.uuid.uuid16 = REMOTE_CHAR_CONTROL_UUID;
-                    
-                    esp_gatt_status_t status = esp_ble_gattc_get_char_by_uuid(
-                        gl_profile.gattc_if, gl_profile.conn_id,
-                        gl_profile.service_start_handle, gl_profile.service_end_handle,
-                        char_uuid, char_elem_result, &count);
-                    
-                    if (status == ESP_GATT_OK && count > 0) {
-                        char_control_handle = char_elem_result[0].char_handle;
-                        ESP_LOGI(GATTC_TAG, "控制通道特征值: handle=%d", char_control_handle);
-                    }
-                    
-                    // 获取反馈通道特征值 (Notify)
-                    char_uuid.uuid.uuid16 = REMOTE_CHAR_FEEDBACK_UUID;
-                    uint16_t fb_count = count;
-                    status = esp_ble_gattc_get_char_by_uuid(
-                        gl_profile.gattc_if, gl_profile.conn_id,
-                        gl_profile.service_start_handle, gl_profile.service_end_handle,
-                        char_uuid, char_elem_result, &fb_count);
-                    
-                    if (status == ESP_GATT_OK && fb_count > 0) {
-                        char_feedback_handle = char_elem_result[0].char_handle;
-                        ESP_LOGI(GATTC_TAG, "反馈通道特征值: handle=%d", char_feedback_handle);
-                        
-                        // 获取CCC描述符句柄并注册Notify
-                        esp_gattc_descr_elem_t *descr_result = 
-                            (esp_gattc_descr_elem_t*)malloc(sizeof(esp_gattc_descr_elem_t) * 2);
-                        if (descr_result) {
-                            uint16_t descr_count = 2;
-                            esp_bt_uuid_t ccc_uuid = {
-                                .len = ESP_UUID_LEN_16,
-                                .uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG
-                            };
-                            status = esp_ble_gattc_get_descr_by_char_handle(
-                                gl_profile.gattc_if, gl_profile.conn_id,
-                                char_feedback_handle, ccc_uuid,
-                                descr_result, &descr_count);
-                            if (status == ESP_GATT_OK && descr_count > 0) {
-                                char_feedback_ccc_handle = descr_result[0].handle;
-                                // 注册Notify
-                                uint8_t notify_val[2] = {0x01, 0x00};  // Enable notification
-                                esp_ble_gattc_write_char_descr(
-                                    gl_profile.gattc_if, gl_profile.conn_id,
-                                    char_feedback_ccc_handle,
-                                    sizeof(notify_val), notify_val,
-                                    ESP_GATT_WRITE_TYPE_NO_RSP,
-                                    ESP_GATT_AUTH_REQ_NONE);
-                                ESP_LOGI(GATTC_TAG, "已注册Notify (CCC handle=%d)", char_feedback_ccc_handle);
-                            }
-                            free(descr_result);
-                        }
-                    }
-                    
-                    // 获取系统命令特征值
-                    char_uuid.uuid.uuid16 = REMOTE_CHAR_COMMAND_UUID;
-                    uint16_t cmd_count = count;
-                    status = esp_ble_gattc_get_char_by_uuid(
-                        gl_profile.gattc_if, gl_profile.conn_id,
-                        gl_profile.service_start_handle, gl_profile.service_end_handle,
-                        char_uuid, char_elem_result, &cmd_count);
-                    
-                    if (status == ESP_GATT_OK && cmd_count > 0) {
-                        char_command_handle = char_elem_result[0].char_handle;
-                        ESP_LOGI(GATTC_TAG, "系统命令特征值: handle=%d", char_command_handle);
-                    }
-                    
-                    free(char_elem_result);
-                }
-            }
-            
-            // 启动测试定时器和按键扫描任务
+            discover_all_characteristics();
             if (char_control_handle != INVALID_HANDLE) {
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
-                
-                // 初始化接收时间
-                last_recv_time = esp_timer_get_time() / 1000;
-                heartbeat_timeout = false;
-                
-                // 更新LED状态：已连接
-                ws2812_update_connection(true);
-                ws2812_update_battery(70);  // 模拟电量70%
-                ws2812_pairing_animation();
-                
-                esp_timer_create_args_t timer_args = {
-                    .callback = send_test_data,
-                    .arg = NULL,
-                    .name = "test_timer"
-                };
-                esp_err_t timer_ret = esp_timer_create(&timer_args, &test_timer);
-                if (timer_ret != ESP_OK) {
-                    ESP_LOGE(GATTC_TAG, "定时器创建失败: %s", esp_err_to_name(timer_ret));
-                    test_timer = NULL;
-                } else {
-                    timer_ret = esp_timer_start_periodic(test_timer, 500000);
-                    if (timer_ret != ESP_OK) {
-                        ESP_LOGE(GATTC_TAG, "定时器启动失败: %s", esp_err_to_name(timer_ret));
-                        esp_timer_delete(test_timer);
-                        test_timer = NULL;
-                    }
-                }
-                
-                // 启动按键扫描任务（只启动一次）
-                static bool key_task_started = false;
-                if (!key_task_started) {
-                    xTaskCreate(key_scan_task, "key_scan", 2048, NULL, 5, NULL);
-                    key_task_started = true;
-                }
-                
-                // 启动心跳检测任务（只启动一次）
-                static bool heartbeat_task_started = false;
-                if (!heartbeat_task_started) {
-                    xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
-                    heartbeat_task_started = true;
-                }
+                start_connection_tasks();
             }
         }
         break;
