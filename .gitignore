@@ -24,5 +24,4 @@ esp-idf/
 .uploads/
 *.log
 .trae/
-docs/
 firmware/
