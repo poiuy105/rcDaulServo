@@ -30,12 +30,16 @@
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
 #include "led_strip.h"
+#include "esp_task_wdt.h"
 
 #define GATTC_TAG "OWL_CLIENT"
 
 // 心跳超时配置
 #define HEARTBEAT_TIMEOUT_MS    3000    // 3秒无接收认为断线
 #define RECONNECT_DELAY_MS      2000    // 断线后2秒开始重连
+
+/*=== 看门狗配置 ===*/
+#define WDT_TIMEOUT_S           5
 
 // 心跳检测状态
 static volatile bool heartbeat_timeout = false;
@@ -810,6 +814,35 @@ static void send_heartbeat_data(void) {
                    ESP_GATT_WRITE_TYPE_NO_RSP);
 }
 
+/**
+ * @brief 初始化任务看门狗（仅初始化TWDT，不订阅任务）
+ */
+static void wdt_init(void) {
+    esp_err_t ret = esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(GATTC_TAG, "TWDT初始化失败: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(GATTC_TAG, "TWDT已初始化，超时=%ds", WDT_TIMEOUT_S);
+}
+
+/**
+ * @brief 当前任务订阅TWDT（在每个任务入口调用）
+ */
+static void wdt_subscribe(void) {
+    esp_err_t ret = esp_task_wdt_add(NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "TWDT订阅失败: %s", esp_err_to_name(ret));
+    }
+}
+
+/**
+ * @brief 当前任务喂狗（在每个任务主循环中调用）
+ */
+static inline void wdt_feed(void) {
+    esp_task_wdt_reset();
+}
+
 // 定时器回调：仅发送心跳数据（esp_timer回调在ISR上下文，不能做ADC读取）
 static void send_test_data(void *arg) {
     if (!connect || char_control_handle == INVALID_HANDLE) {
@@ -826,6 +859,8 @@ static void key_scan_task(void *arg) {
     uint8_t combo_cooldown = 0;  // 组合键冷却计数器（防止连续触发）
     uint8_t joystick_send_counter = 0;  // 摇杆发送计数器（每50次=500ms发一次）
     static uint8_t comm_led_counter = 0;
+    
+    wdt_subscribe();
     
     while (1) {
         if (connect && char_control_handle != INVALID_HANDLE) {
@@ -889,12 +924,15 @@ static void key_scan_task(void *arg) {
         }
         
         // 10ms扫描一次
+        wdt_feed();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 // 心跳检测任务（检测最后一次接收任何数据的时间）
 static void heartbeat_monitor_task(void *arg) {
+    wdt_subscribe();
+    
     while (1) {
         if (connect) {
             int64_t now = esp_timer_get_time() / 1000;
@@ -913,6 +951,7 @@ static void heartbeat_monitor_task(void *arg) {
         }
         
         vTaskDelay(pdMS_TO_TICKS(1000));  // 每秒检查一次
+        wdt_feed();
     }
 }
 
@@ -1312,6 +1351,9 @@ void app_main(void) {
     if (ret) {
         ESP_LOGE(GATTC_TAG, "设置 MTU 失败: %x", ret);
     }
+
+    // 初始化任务看门狗
+    wdt_init();
 
     // 初始化摇杆ADC
     joystick_adc_init();

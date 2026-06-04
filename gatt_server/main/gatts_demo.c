@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_task_wdt.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -36,6 +37,9 @@
 
 // 心跳超时配置
 #define HEARTBEAT_TIMEOUT_MS    5000    // 5秒无心跳认为断线
+
+/*=== 看门狗配置 ===*/
+#define WDT_TIMEOUT_S           5
 
 // 全局状态互斥锁
 static SemaphoreHandle_t g_state_mutex = NULL;
@@ -85,6 +89,36 @@ static void record_delete(uint8_t slot);
 static uint8_t joystick_to_angle(uint8_t joystick_val);
 static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_t z);
 static uint16_t radar_coord_to_angle(float coord, float gain);
+
+/*=== 看门狗函数 ===*/
+/**
+ * @brief 初始化任务看门狗（仅初始化TWDT，不订阅任务）
+ */
+static void wdt_init(void) {
+    esp_err_t ret = esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(GATTS_TAG, "TWDT初始化失败: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(GATTS_TAG, "TWDT已初始化，超时=%ds", WDT_TIMEOUT_S);
+}
+
+/**
+ * @brief 当前任务订阅TWDT（在每个任务入口调用）
+ */
+static void wdt_subscribe(void) {
+    esp_err_t ret = esp_task_wdt_add(NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "TWDT订阅失败: %s", esp_err_to_name(ret));
+    }
+}
+
+/**
+ * @brief 当前任务喂狗（在每个任务主循环中调用）
+ */
+static inline void wdt_feed(void) {
+    esp_task_wdt_reset();
+}
 
 /*============================================================================
  *                         后台任务队列 (BLE回调解耦)
@@ -205,6 +239,7 @@ static uint8_t last_seq = 0;
 
 // 心跳检测任务
 static void heartbeat_monitor_task(void *arg) {
+    wdt_subscribe();
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
         int64_t local_last_heartbeat = 0;
@@ -236,6 +271,7 @@ static void heartbeat_monitor_task(void *arg) {
             }
         }
         
+        wdt_feed();
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -745,6 +781,7 @@ static void security_radar_handler(radar_data_t *data) {
 
 static void preset_player_task(void *arg) {
     uint8_t local_slot = 0;
+    wdt_subscribe();
     if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         local_slot = g_preset_slot;
         xSemaphoreGive(g_state_mutex);
@@ -851,6 +888,7 @@ static void preset_player_task(void *arg) {
             relay_cannon_on = (f->relay_flags & OWL_RELAY_CANNON) != 0;
             xSemaphoreGive(g_state_mutex);
         }
+        wdt_feed();
     }
 
     free(frames);
@@ -868,6 +906,7 @@ static void preset_player_task(void *arg) {
         send_event_notify(OWL_EVENT_PRESET_COMPLETED, local_slot, 0, 0);
     }
 
+    esp_task_wdt_delete(NULL);
     vTaskDelete(NULL);
 }
 
@@ -1228,6 +1267,7 @@ static void mode_switch(owl_mode_t new_mode) {
 
 // 安防模式定时更新任务
 static void security_task(void *arg) {
+    wdt_subscribe();
     while (1) {
         owl_mode_t local_mode = OWL_MODE_REMOTE;
         if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1237,6 +1277,7 @@ static void security_task(void *arg) {
         if (local_mode == OWL_MODE_SECURITY) {
             security_update();
         }
+        wdt_feed();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -1384,6 +1425,7 @@ static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
 // 后台任务工作函数（处理NVS操作、模式切换延时、录制/预设启停）
 static void bg_task_worker(void *arg) {
     bg_task_msg_t msg;
+    wdt_subscribe();
     while (1) {
         if (xQueueReceive(g_bg_task_queue, &msg, portMAX_DELAY) == pdTRUE) {
             switch (msg.type) {
@@ -1414,6 +1456,7 @@ static void bg_task_worker(void *arg) {
                     break;
             }
         }
+        wdt_feed();
     }
 }
 
@@ -1928,6 +1971,9 @@ void app_main(void) {
         ESP_LOGE(GATTS_TAG, "后台任务队列创建失败");
         return;
     }
+
+    // 初始化任务看门狗
+    wdt_init();
 
     // 初始化舵机
     servo_init();
