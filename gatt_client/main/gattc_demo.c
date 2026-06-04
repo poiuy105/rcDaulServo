@@ -1004,10 +1004,7 @@ static void heartbeat_monitor_task(void *arg) {
  *                              GAP 事件处理
  *============================================================================*/
 
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param_t *param) {
-    // 防止扫描回调重复触发连接请求
-    static bool is_connecting = false;
-
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
         esp_ble_gap_start_scanning(30);  // 扫描 30 秒
@@ -1019,14 +1016,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param
             break;
         }
         ESP_LOGI(GATTC_TAG, "开始扫描...");
-        is_connecting = false;  // 新一轮扫描开始，重置连接标志
         break;
         
     case ESP_GAP_BLE_SCAN_RESULT_EVT:
         if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-            // 防重入：已在连接中则忽略后续扫描结果
-            if (is_connecting) return;
-
             // 检查设备名
             uint8_t *adv_name = NULL;
             uint8_t adv_name_len = 0;
@@ -1054,15 +1047,11 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param
                     ESP_LOGI(GATTC_TAG, "未绑定状态，将绑定此设备");
                 }
                 
-                // 标记正在连接，防止重复触发
-                is_connecting = true;
-
                 // 停止扫描并连接
                 esp_ble_gap_stop_scanning();
                 esp_gatt_status_t open_ret = esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
                 if (open_ret != ESP_GATT_OK) {
                     ESP_LOGE(GATTC_TAG, "连接请求失败: 0x%x", open_ret);
-                    is_connecting = false;  // 连接失败，重置标志允许重试
                 }
                 }
             }
