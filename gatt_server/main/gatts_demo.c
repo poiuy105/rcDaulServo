@@ -95,7 +95,12 @@ static uint16_t radar_coord_to_angle(float coord, float gain);
  * @brief 初始化任务看门狗（仅初始化TWDT，不订阅任务）
  */
 static void wdt_init(void) {
-    esp_err_t ret = esp_task_wdt_init(WDT_TIMEOUT_S, true);
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_S * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // 监控所有核心的idle任务
+        .trigger_panic = true,
+    };
+    esp_err_t ret = esp_task_wdt_init(&wdt_config);
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(GATTS_TAG, "TWDT初始化失败: %s", esp_err_to_name(ret));
         return;
