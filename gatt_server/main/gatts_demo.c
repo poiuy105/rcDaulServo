@@ -1417,6 +1417,9 @@ static void parse_heartbeat_packet(owl_heartbeat_pkt_t *pkt) {
         last_heartbeat_time = esp_timer_get_time() / 1000;
         xSemaphoreGive(g_state_mutex);
     }
+
+    // 回复ACK，让客户端更新last_recv_time避免误报超时
+    send_ack(OWL_PKT_HEARTBEAT, 0);
 }
 
 // 后台任务工作函数（处理NVS操作、模式切换延时、录制/预设启停）
