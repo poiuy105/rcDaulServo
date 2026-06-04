@@ -253,6 +253,10 @@ static void ws2812_update_comm(bool sending) {
     ws2812_set_led(LED_COMM, sending ? COLOR_CYAN : COLOR_GREEN);
 }
 
+// 看门狗函数前置声明（定义在文件后面）
+static void wdt_subscribe(void);
+static inline void wdt_feed(void);
+
 // LED更新任务：在独立任务上下文中执行RMT操作，避免在BLE回调中操作RMT
 static void led_update_task(void *arg) {
     ESP_LOGI(GATTC_TAG, "LED更新任务启动");
