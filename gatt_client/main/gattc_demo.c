@@ -83,8 +83,18 @@ static const led_color_t COLOR_WHITE   = {255, 255, 255};
 static const led_color_t COLOR_PINK    = {255, 192, 203};
 
 // LED状态
-static led_color_t led_colors[WS2812_LED_NUM];
+static volatile led_color_t led_colors[WS2812_LED_NUM];
 static led_strip_handle_t led_strip = NULL;
+static volatile bool led_dirty = false;  // 标记LED状态是否有更新需要刷新
+
+// LED动画状态机（用于配对动画等需要延时的动画）
+typedef enum {
+    LED_ANIM_NONE = 0,
+    LED_ANIM_PAIRING,
+} led_anim_type_t;
+static volatile led_anim_type_t led_anim_type = LED_ANIM_NONE;
+static volatile uint8_t led_anim_step = 0;
+static volatile bool led_anim_request = false;
 
 // 初始化WS2812
 static void ws2812_init(void) {
@@ -115,20 +125,16 @@ static void ws2812_init(void) {
     ESP_LOGI(GATTC_TAG, "  GPIO: %d, LED数量: %d", WS2812_GPIO, WS2812_LED_NUM);
 }
 
-// 设置单个LED颜色
+// 设置单个LED颜色（仅更新内存，标记dirty由led_task刷新）
 static void ws2812_set_led(int index, led_color_t color) {
     if (index < 0 || index >= WS2812_LED_NUM) return;
-    
     led_colors[index] = color;
-    led_strip_set_pixel(led_strip, index, 
-                        (color.r * WS2812_BRIGHTNESS) / 255,
-                        (color.g * WS2812_BRIGHTNESS) / 255,
-                        (color.b * WS2812_BRIGHTNESS) / 255);
-    led_strip_refresh(led_strip);
+    led_dirty = true;
 }
 
-// 刷新所有LED
-static void ws2812_refresh(void) {
+// 刷新所有LED到硬件（仅在任务上下文中调用）
+static void ws2812_refresh_hw(void) {
+    if (led_strip == NULL) return;
     for (int i = 0; i < WS2812_LED_NUM; i++) {
         led_strip_set_pixel(led_strip, i,
                             (led_colors[i].r * WS2812_BRIGHTNESS) / 255,
@@ -138,12 +144,12 @@ static void ws2812_refresh(void) {
     led_strip_refresh(led_strip);
 }
 
-// 关闭所有LED
+// 关闭所有LED（仅更新内存）
 static void ws2812_all_off(void) {
     for (int i = 0; i < WS2812_LED_NUM; i++) {
         led_colors[i] = COLOR_OFF;
     }
-    led_strip_clear(led_strip);
+    led_dirty = true;
 }
 
 // 启动动画（彩虹渐变）
@@ -177,23 +183,11 @@ static void ws2812_startup_animation(void) {
 static void ws2812_update_connection(bool connected);
 static void ws2812_update_battery(uint8_t battery_percent);
 
-// 配对成功动画
-static void ws2812_pairing_animation(void) {
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < WS2812_LED_NUM; j++) {
-            led_strip_set_pixel(led_strip, j,
-                                (COLOR_WHITE.r * WS2812_BRIGHTNESS) / 255,
-                                (COLOR_WHITE.g * WS2812_BRIGHTNESS) / 255,
-                                (COLOR_WHITE.b * WS2812_BRIGHTNESS) / 255);
-        }
-        led_strip_refresh(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        led_strip_clear(led_strip);
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    // 动画结束后恢复连接和电量显示
-    ws2812_update_connection(true);
-    ws2812_update_battery(70);
+// 请求配对动画（仅设置标志，由led_task在任务上下文中执行）
+static void ws2812_request_pairing_animation(void) {
+    led_anim_type = LED_ANIM_PAIRING;
+    led_anim_step = 0;
+    led_anim_request = true;
 }
 
 // LED状态更新函数定义
@@ -257,6 +251,57 @@ static void ws2812_update_key(uint8_t switch1, uint8_t switch2, uint8_t joystick
 
 static void ws2812_update_comm(bool sending) {
     ws2812_set_led(LED_COMM, sending ? COLOR_CYAN : COLOR_GREEN);
+}
+
+// LED更新任务：在独立任务上下文中执行RMT操作，避免在BLE回调中操作RMT
+static void led_update_task(void *arg) {
+    ESP_LOGI(GATTC_TAG, "LED更新任务启动");
+    wdt_subscribe();
+
+    while (1) {
+        // 处理动画
+        if (led_anim_request && led_strip != NULL) {
+            if (led_anim_type == LED_ANIM_PAIRING) {
+                // 配对动画：3次白色闪烁
+                // 每步200ms，总动画时间 = 6步 × 200ms = 1.2s
+                if (led_anim_step < 6) {
+                    if (led_anim_step % 2 == 0) {
+                        // 亮白色
+                        for (int j = 0; j < WS2812_LED_NUM; j++) {
+                            led_strip_set_pixel(led_strip, j,
+                                (COLOR_WHITE.r * WS2812_BRIGHTNESS) / 255,
+                                (COLOR_WHITE.g * WS2812_BRIGHTNESS) / 255,
+                                (COLOR_WHITE.b * WS2812_BRIGHTNESS) / 255);
+                        }
+                        led_strip_refresh(led_strip);
+                    } else {
+                        // 灭
+                        led_strip_clear(led_strip);
+                    }
+                    led_anim_step++;
+                } else {
+                    // 动画结束，恢复连接和电量显示
+                    led_anim_request = false;
+                    led_anim_type = LED_ANIM_NONE;
+                    ws2812_update_connection(true);
+                    ws2812_update_battery(70);
+                    led_dirty = true;
+                }
+            } else {
+                led_anim_request = false;
+                led_anim_type = LED_ANIM_NONE;
+            }
+        }
+
+        // 刷新dirty的LED状态到硬件
+        if (led_dirty && led_strip != NULL) {
+            ws2812_refresh_hw();
+            led_dirty = false;
+        }
+
+        wdt_feed();
+        vTaskDelay(pdMS_TO_TICKS(200));  // 200ms刷新周期
+    }
 }
 
 /*============================================================================
@@ -1095,10 +1140,10 @@ static void start_connection_tasks(void) {
     last_recv_time = esp_timer_get_time() / 1000;
     heartbeat_timeout = false;
 
-    // 更新LED状态
+    // 更新LED状态（仅设置内存，由led_task刷新到硬件）
     ws2812_update_connection(true);
     ws2812_update_battery(70);
-    ws2812_pairing_animation();
+    ws2812_request_pairing_animation();
 
     // 创建定时器
     esp_timer_create_args_t timer_args = {
@@ -1131,6 +1176,13 @@ static void start_connection_tasks(void) {
     if (!heartbeat_task_started) {
         xTaskCreate(heartbeat_monitor_task, "heartbeat_monitor", 2048, NULL, 5, NULL);
         heartbeat_task_started = true;
+    }
+
+    // 启动LED更新任务（只启动一次，负责RMT操作）
+    static bool led_task_started = false;
+    if (!led_task_started) {
+        xTaskCreate(led_update_task, "led_update", 2048, NULL, 5, NULL);
+        led_task_started = true;
     }
 }
 
