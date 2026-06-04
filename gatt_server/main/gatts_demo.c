@@ -95,17 +95,9 @@ static uint16_t radar_coord_to_angle(float coord, float gain);
  * @brief 初始化任务看门狗（仅初始化TWDT，不订阅任务）
  */
 static void wdt_init(void) {
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = WDT_TIMEOUT_S * 1000,
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // 监控所有核心的idle任务
-        .trigger_panic = true,
-    };
-    esp_err_t ret = esp_task_wdt_init(&wdt_config);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(GATTS_TAG, "TWDT初始化失败: %s", esp_err_to_name(ret));
-        return;
-    }
-    ESP_LOGI(GATTS_TAG, "TWDT已初始化，超时=%ds", WDT_TIMEOUT_S);
+    // ESP-IDF v5.4 sdkconfig中CONFIG_ESP_TASK_WDT=y已自动初始化TWDT
+    // 仅记录日志，跳过重复初始化
+    ESP_LOGI(GATTS_TAG, "TWDT超时=%ds（由sdkconfig自动初始化）", WDT_TIMEOUT_S);
 }
 
 /**
@@ -1432,7 +1424,7 @@ static void bg_task_worker(void *arg) {
     bg_task_msg_t msg;
     wdt_subscribe();
     while (1) {
-        if (xQueueReceive(g_bg_task_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(g_bg_task_queue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
             switch (msg.type) {
                 case BG_TASK_MODE_SWITCH:
                     mode_switch((owl_mode_t)msg.param);
