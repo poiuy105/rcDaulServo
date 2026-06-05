@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 env:
-  IDF_VERSION: release-v5.4
+  IDF_VERSION: v5.4.4
   TARGET_CHIP: esp32c3
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
     - name: Build and Merge BIN
       uses: espressif/esp-idf-ci-action@v1
       with:
-        esp_idf_version: release-v5.4
+        esp_idf_version: v5.4.4
         target: esp32c3
         path: ${{ matrix.project.path }}
         command: >
