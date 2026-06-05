@@ -1004,7 +1004,7 @@ static void heartbeat_monitor_task(void *arg) {
  *                              GAP 事件处理
  *============================================================================*/
 
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param_t *param) {
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
         esp_ble_gap_start_scanning(30);  // 扫描 30 秒
