@@ -1212,12 +1212,29 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
         ESP_LOGI(GATTC_TAG, "猫头鹰 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->open.remote_bda));
         gl_profile.conn_id = param->open.conn_id;
         memcpy(gl_profile.remote_bda, param->open.remote_bda, sizeof(esp_bd_addr_t));
-        
+
         // 首次连接，保存绑定信息
         if (!g_is_bound) {
             save_bound_mac(param->open.remote_bda);
         }
-        
+
+        // 更新连接参数：使用更宽松的间隔，降低断线概率
+        // min_interval=30ms, max_interval=50ms, latency=0, timeout=500ms
+        esp_ble_conn_update_params_t conn_params = {
+            .bda = {0},
+            .min_int = 0x0018,  // 30ms (单位1.25ms)
+            .max_int = 0x0028,  // 50ms (单位1.25ms)
+            .latency = 0,
+            .timeout = 400       // 4s supervision timeout (单位10ms)
+        };
+        memcpy(conn_params.bda, param->open.remote_bda, sizeof(esp_bd_addr_t));
+        esp_err_t update_ret = esp_ble_gap_update_conn_params(&conn_params);
+        if (update_ret != ESP_OK) {
+            ESP_LOGW(GATTC_TAG, "更新连接参数失败: %s", esp_err_to_name(update_ret));
+        } else {
+            ESP_LOGI(GATTC_TAG, "已请求更新连接参数: interval=30-50ms, timeout=4s");
+        }
+
         esp_ble_gattc_send_mtu_req(gattc_if, param->open.conn_id);
         break;
         
