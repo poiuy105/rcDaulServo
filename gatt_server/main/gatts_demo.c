@@ -1657,7 +1657,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     /*=== BLE 安全/加密相关事件 ===*/
     case ESP_GAP_BLE_SEC_REQ_EVT:
         /* 收到客户端的加密请求，同意并启动加密 */
-        esp_ble_gap_security_rsp(param->ble_security_req.bd_addr, true);
+        esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
         break;
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
         if (param->ble_security.auth_cmpl.success) {
