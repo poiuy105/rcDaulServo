@@ -1660,10 +1660,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         esp_ble_gap_security_rsp(param->ble_security_req.bd_addr, true);
         break;
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
-        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGI(GATTS_TAG, "BLE 加密成功, auth_mode=0x%x", param->auth_cmpl.auth_mode);
+        if (param->ble_security.auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(GATTS_TAG, "BLE 加密成功, auth_mode=0x%x", param->ble_security.auth_cmpl.auth_mode);
         } else {
-            ESP_LOGW(GATTS_TAG, "BLE 加密失败, stat=0x%x", param->auth_cmpl.stat);
+            ESP_LOGW(GATTS_TAG, "BLE 加密失败, stat=0x%x", param->ble_security.auth_cmpl.stat);
         }
         break;
     case ESP_GAP_BLE_REMOVE_BOND_DEV_COMPLETE_EVT:
@@ -1957,11 +1957,8 @@ void app_main(void) {
     // 设置 IO 能力为 No Input No Output（Just Works，无需用户输入配对码）
     esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
     esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
-    // 设置绑定模式：发起绑定，存储绑定信息到NVS
-    uint8_t bond_mode = ESP_BLE_SEC_BOND_MODE_REQ;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_BOND_MODE, &bond_mode, sizeof(bond_mode));
-    // 认证请求：无需 MITM（Just Works 足够玩具场景）
-    uint8_t auth_req = ESP_LE_AUTH_REQ_NO_MITM;
+    // 认证请求：Bonding + 无 MITM（Just Works 足够玩具场景）
+    uint8_t auth_req = ESP_LE_AUTH_REQ_BOND;
     esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
     // 密钥大小：默认最大 16 字节 (128-bit)
     uint8_t key_size = 16;
