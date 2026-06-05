@@ -1004,9 +1004,6 @@ static void heartbeat_monitor_task(void *arg) {
  *                              GAP 事件处理
  *============================================================================*/
 
-// BLE scan guard
-static volatile bool g_is_scan_connecting = false;
-
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param_t *param) {
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
@@ -1019,13 +1016,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param
             break;
         }
         ESP_LOGI(GATTC_TAG, "开始扫描...");
-        g_is_scan_connecting = false;
         break;
         
     case ESP_GAP_BLE_SCAN_RESULT_EVT:
         if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
-            if (g_is_scan_connecting) return;
-
             // 检查设备名
             uint8_t *adv_name = NULL;
             uint8_t adv_name_len = 0;
@@ -1053,14 +1047,11 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_gap_ble_cb_param
                     ESP_LOGI(GATTC_TAG, "未绑定状态，将绑定此设备");
                 }
                 
-                g_is_scan_connecting = true;
-
                 // 停止扫描并连接
                 esp_ble_gap_stop_scanning();
                 esp_gatt_status_t open_ret = esp_ble_gattc_open(gl_profile.gattc_if, param->scan_rst.bda, BLE_ADDR_TYPE_PUBLIC, true);
                 if (open_ret != ESP_GATT_OK) {
                     ESP_LOGE(GATTC_TAG, "连接请求失败: 0x%x", open_ret);
-                    g_is_scan_connecting = false;
                 }
                 }
             }

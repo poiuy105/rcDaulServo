@@ -1,0 +1,27 @@
+# Force LF line endings for all text files
+* text=auto eol=lf
+
+# C/C++ source files
+*.c text eol=lf
+*.h text eol=lf
+
+# Config files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+
+# Build files
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+Kconfig* text eol=lf
+sdkconfig* text eol=lf
+
+# Binary files
+*.bin binary
+*.hex binary
+*.elf binary
+*.png binary
+*.jpg binary
