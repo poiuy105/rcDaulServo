@@ -25,7 +25,7 @@ jobs:
         target: esp32c3
         path: ${{ matrix.project.path }}
         command: >
-          bash -c "idf.py build &&
+          bash -c "idf.py fullclean && idf.py build &&
           esptool.py --chip esp32c3 merge_bin
           -o build/${{ matrix.project.name }}_merged.bin
           --flash_mode dio --flash_freq 80m --flash_size 4MB
