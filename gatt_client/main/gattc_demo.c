@@ -1064,10 +1064,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         
     /*=== BLE 安全/加密相关事件 ===*/
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
-        if (param->ble_security.auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+        if (param->ble_security.auth_cmpl.success) {
             ESP_LOGI(GATTC_TAG, "BLE 加密成功, auth_mode=0x%x", param->ble_security.auth_cmpl.auth_mode);
         } else {
-            ESP_LOGW(GATTC_TAG, "BLE 加密失败, stat=0x%x", param->ble_security.auth_cmpl.stat);
+            ESP_LOGW(GATTC_TAG, "BLE 加密失败, reason=0x%x", param->ble_security.auth_cmpl.fail_reason);
         }
         break;
     case ESP_GAP_BLE_REMOVE_BOND_DEV_COMPLETE_EVT:
@@ -1434,7 +1434,7 @@ void app_main(void) {
     esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
     esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
     // 认证请求：Bonding + 无 MITM
-    uint8_t auth_req = ESP_LE_AUTH_REQ_BOND;
+    uint8_t auth_req = ESP_LE_AUTH_BOND;
     esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
     // 密钥大小：16 字节 (128-bit)
     uint8_t key_size = 16;
