@@ -1654,6 +1654,26 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                  param->update_conn_params.latency,
                  param->update_conn_params.timeout);
         break;
+    /*=== BLE 安全/加密相关事件 ===*/
+    case ESP_GAP_BLE_SEC_REQ_EVT:
+        /* 收到客户端的加密请求，同意并启动加密 */
+        esp_ble_gap_security_rsp(param->ble_security_req.bd_addr, true);
+        break;
+    case ESP_GAP_BLE_AUTH_CMPL_EVT:
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(GATTS_TAG, "BLE 加密成功, auth_mode=0x%x", param->auth_cmpl.auth_mode);
+        } else {
+            ESP_LOGW(GATTS_TAG, "BLE 加密失败, stat=0x%x", param->auth_cmpl.stat);
+        }
+        break;
+    case ESP_GAP_BLE_REMOVE_BOND_DEV_COMPLETE_EVT:
+        ESP_LOGI(GATTS_TAG, "绑定设备已移除");
+        break;
+    case ESP_GAP_BLE_SET_LOCAL_PRIVACY_COMPLETE_EVT:
+        if (param->local_privacy_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "设置本地隐私失败");
+        }
+        break;
     default:
         break;
     }
@@ -1932,6 +1952,26 @@ void app_main(void) {
         ESP_LOGE(GATTS_TAG, "GAP 回调注册失败: %x", ret);
         return;
     }
+
+    /*=== BLE 安全参数配置 ===*/
+    // 设置 IO 能力为 No Input No Output（Just Works，无需用户输入配对码）
+    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
+    // 设置绑定模式：发起绑定，存储绑定信息到NVS
+    uint8_t bond_mode = ESP_BLE_SEC_BOND_MODE_REQ;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_BOND_MODE, &bond_mode, sizeof(bond_mode));
+    // 认证请求：无需 MITM（Just Works 足够玩具场景）
+    uint8_t auth_req = ESP_LE_AUTH_REQ_NO_MITM;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
+    // 密钥大小：默认最大 16 字节 (128-bit)
+    uint8_t key_size = 16;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
+    // 初始化密钥类型
+    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
+    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
+    ESP_LOGI(GATTS_TAG, "BLE 安全参数已配置 (Just Works, Bonding)");
 
     // 注册应用
     ret = esp_ble_gatts_app_register(PROFILE_APP_ID);
