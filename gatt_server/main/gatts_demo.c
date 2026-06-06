@@ -529,7 +529,7 @@ static void send_radar_notify(uint8_t target_count, int16_t x, int16_t y, int16_
 
     esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
-                                 gl_profile.descr_feedback_handle,
+                                 gl_profile.char_feedback_handle,
                                  sizeof(pkt), pkt, false);
     if (rc != ESP_GATT_OK) {
         ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
@@ -555,7 +555,7 @@ static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_
     
     esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
-                                 gl_profile.descr_feedback_handle,
+                                 gl_profile.char_feedback_handle,
                                  sizeof(pkt), (uint8_t*)&pkt, false);
     if (rc != ESP_GATT_OK) {
         ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
@@ -576,7 +576,7 @@ static void send_ack(uint8_t cmd, uint8_t result) {
     
     esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
-                                 gl_profile.descr_feedback_handle,
+                                 gl_profile.char_feedback_handle,
                                  sizeof(pkt), (uint8_t*)&pkt, false);
     if (rc != ESP_GATT_OK) {
         ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
