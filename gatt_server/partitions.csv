@@ -1,4 +1,6 @@
 # Name,   Type, SubType, Offset,  Size,   Flags
-nvs,      data, nvs,     ,        0x10000,
-phy_init, data, phy,     ,        0x1000,
-factory,  app,  factory, ,        1M,
+# Layout matches merge_bin script:
+#   bootloader @ 0x0, partition table @ 0x8000, factory app @ 0x20000
+nvs,      data, nvs,     0x9000,  0x10000,
+phy_init, data, phy,     0x19000, 0x1000,
+factory,  app,  factory, 0x20000, 0xE0000,
