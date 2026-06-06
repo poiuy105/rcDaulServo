@@ -113,7 +113,12 @@ static void ws2812_init(void) {
         .flags.with_dma = false,
     };
 
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    esp_err_t ret = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTC_TAG, "WS2812 LED初始化失败: %s", esp_err_to_name(ret));
+        led_strip = NULL;
+        return;
+    }
     
     // 初始状态：全部关闭
     for (int i = 0; i < WS2812_LED_NUM; i++) {
@@ -122,7 +127,7 @@ static void ws2812_init(void) {
     led_strip_clear(led_strip);
     
     ESP_LOGI(GATTC_TAG, "WS2812 LED初始化完成");
-    ESP_LOGI(GATTC_TAG, "  GPIO: %d, LED数量: %d", WS2812_GPIO, WS2812_LED_NUM);
+    ESP_LOGI(GATTC_TAG, "  GPIO: %d, LED数量: %d, handle=%p", WS2812_GPIO, WS2812_LED_NUM, (void*)led_strip);
 }
 
 // 设置单个LED颜色（仅更新内存，标记dirty由led_task刷新）
@@ -134,14 +139,20 @@ static void ws2812_set_led(int index, led_color_t color) {
 
 // 刷新所有LED到硬件（仅在任务上下文中调用）
 static void ws2812_refresh_hw(void) {
-    if (led_strip == NULL) return;
+    if (led_strip == NULL) {
+        ESP_LOGW(GATTC_TAG, "ws2812_refresh_hw: led_strip is NULL");
+        return;
+    }
     for (int i = 0; i < WS2812_LED_NUM; i++) {
         led_strip_set_pixel(led_strip, i,
                             (led_colors[i].r * WS2812_BRIGHTNESS) / 255,
                             (led_colors[i].g * WS2812_BRIGHTNESS) / 255,
                             (led_colors[i].b * WS2812_BRIGHTNESS) / 255);
     }
-    led_strip_refresh(led_strip);
+    esp_err_t ret = led_strip_refresh(led_strip);
+    if (ret != ESP_OK) {
+        ESP_LOGW(GATTC_TAG, "led_strip_refresh失败: %s", esp_err_to_name(ret));
+    }
 }
 
 // 关闭所有LED（仅更新内存）
