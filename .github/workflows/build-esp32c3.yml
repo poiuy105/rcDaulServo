@@ -31,7 +31,7 @@ jobs:
           --flash_mode dio --flash_freq 80m --flash_size 4MB
           0x0 build/bootloader/bootloader.bin
           0x8000 build/partition_table/partition-table.bin
-          0x20000 build/${{ matrix.project.bin_name }}.bin"
+          0x10000 build/${{ matrix.project.bin_name }}.bin"
     - uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.project.name }}_merged.bin
