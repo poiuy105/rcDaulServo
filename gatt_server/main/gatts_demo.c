@@ -556,7 +556,7 @@ static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_
     esp_gatt_status_t rc = esp_ble_gatts_send_indicate(gl_profile.gatts_if,
                                  gl_profile.conn_id,
                                  gl_profile.char_feedback_handle,
-                                 sizeof(pkt), (uint8_t*)&pkt, false);
+                                 sizeof(pkt), (uint8_t*)&pkt, true);
     if (rc != ESP_GATT_OK) {
         ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
     }
@@ -1768,7 +1768,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
             esp_bt_uuid_t char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = OWL_CHAR_FEEDBACK_UUID};
             ret = esp_ble_gatts_add_char(gl_profile.service_handle, &char_uuid,
                                    ESP_GATT_PERM_READ,
-                                   ESP_GATT_CHAR_PROP_BIT_NOTIFY,
+                                   ESP_GATT_CHAR_PROP_BIT_INDICATE,
                                    NULL, NULL);
             if (ret != ESP_GATT_OK) {
                 ESP_LOGE(GATTS_TAG, "添加反馈通道特征值失败: %d", ret);

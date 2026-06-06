@@ -1133,11 +1133,11 @@ static void discover_all_characteristics(void) {
             if (esp_ble_gattc_get_descr_by_char_handle(gl_profile.gattc_if, gl_profile.conn_id,
                     char_feedback_handle, ccc_uuid, descr, &d_cnt) == ESP_GATT_OK && d_cnt > 0) {
                 char_feedback_ccc_handle = descr[0].handle;
-                uint8_t notify_val[2] = {0x01, 0x00};
+                uint8_t indicate_val[2] = {0x02, 0x00};
                 esp_ble_gattc_write_char_descr(gl_profile.gattc_if, gl_profile.conn_id,
-                    char_feedback_ccc_handle, sizeof(notify_val), notify_val,
+                    char_feedback_ccc_handle, sizeof(indicate_val), indicate_val,
                     ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
-                ESP_LOGI(GATTC_TAG, "已注册Notify (CCC handle=%d)", char_feedback_ccc_handle);
+                ESP_LOGI(GATTC_TAG, "已注册Indicate (CCC handle=%d)", char_feedback_ccc_handle);
             }
             free(descr);
         }
