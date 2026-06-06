@@ -719,8 +719,8 @@ static void send_joystick_data(void) {
     // 发送摇杆数据
     owl_joystick_pkt_t pkt;
     build_joystick_packet(&pkt, x, y, btn);
-    ESP_LOGD(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
-    ESP_LOGD(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
+    ESP_LOGI(GATTC_TAG, ">>> 发送 JOYSTICK 包 (真实摇杆)");
+    ESP_LOGI(GATTC_TAG, "    X=%d, Y=%d, 按键=%s", pkt.x_axis, pkt.y_axis, pkt.button_flags ? "按下" : "松开");
     BLE_WRITE_CHAR(gl_profile.gattc_if, gl_profile.conn_id,
                    char_control_handle, &pkt, sizeof(pkt),
                    ESP_GATT_WRITE_TYPE_NO_RSP);
@@ -931,6 +931,7 @@ static void key_scan_task(void *arg) {
             joystick_send_counter++;
             if (joystick_send_counter >= 50) {
                 joystick_send_counter = 0;
+                ESP_LOGI(GATTC_TAG, "摇杆计数器触发: connect=%d, handle=%d", connect, char_control_handle);
                 send_joystick_data();
             }
             
