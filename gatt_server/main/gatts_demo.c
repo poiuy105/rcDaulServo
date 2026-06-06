@@ -584,6 +584,8 @@ static void send_ack(uint8_t cmd, uint8_t result) {
     if (rc != ESP_GATT_OK) {
         ESP_LOGW(GATTS_TAG, "ACK indicate发送失败: rc=0x%x, gatts_if=%d, conn_id=%d, handle=%d",
                  rc, gl_profile.gatts_if, gl_profile.conn_id, gl_profile.char_feedback_handle);
+    } else {
+        ESP_LOGI(GATTS_TAG, "ACK发送成功: cmd=0x%02X, handle=%d", cmd, gl_profile.char_feedback_handle);
     }
 }
 

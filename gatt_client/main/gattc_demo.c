@@ -1290,6 +1290,7 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
     case ESP_GATTC_NOTIFY_EVT:
         // 更新接收时间（用于心跳超时检测）
         last_recv_time = esp_timer_get_time() / 1000;
+        ESP_LOGI(GATTC_TAG, "收到Notify: handle=%d, len=%d", param->notify.handle, param->notify.value_len);
         
         if (param->notify.handle == char_control_handle || param->notify.handle == char_feedback_handle) {
             uint8_t *p_data = param->notify.value;
