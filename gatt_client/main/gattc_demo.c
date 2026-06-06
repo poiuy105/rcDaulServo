@@ -368,19 +368,40 @@ static void joystick_adc_init(void) {
     ESP_LOGI(GATTC_TAG, "  按键: GPIO%d", JOYSTICK_BTN_GPIO);
 }
 
-// 读取摇杆值
+// 摇杆校准参数（根据实际硬件调整）
+#define JOYSTICK_CENTER_X       2426    // 中点ADC值（实测约2426）
+#define JOYSTICK_CENTER_Y       2410    // 中点ADC值（实测约2410）
+#define JOYSTICK_DEADZONE       200     // 死区范围（ADC值）
+
+// 读取摇杆值（带校准和死区）
 static void joystick_read(uint8_t *x, uint8_t *y, uint8_t *btn) {
-    int raw_x = 2048, raw_y = 2048;  // 默认中点值
+    int raw_x = JOYSTICK_CENTER_X, raw_y = JOYSTICK_CENTER_Y;
 
     if (adc_oneshot_read(adc_handle, JOYSTICK_X_CHANNEL, &raw_x) != ESP_OK) {
-        raw_x = 2048;
+        raw_x = JOYSTICK_CENTER_X;
     }
     if (adc_oneshot_read(adc_handle, JOYSTICK_Y_CHANNEL, &raw_y) != ESP_OK) {
-        raw_y = 2048;
+        raw_y = JOYSTICK_CENTER_Y;
     }
 
-    *x = (uint8_t)((raw_x * 255) / 4095);
-    *y = (uint8_t)((raw_y * 255) / 4095);
+    // 死区处理：中点附近视为中点
+    int dx = raw_x - JOYSTICK_CENTER_X;
+    int dy = raw_y - JOYSTICK_CENTER_Y;
+    if (abs(dx) < JOYSTICK_DEADZONE) raw_x = JOYSTICK_CENTER_X;
+    if (abs(dy) < JOYSTICK_DEADZONE) raw_y = JOYSTICK_CENTER_Y;
+
+    // 映射到 0-255（以校准后的中点为128）
+    int mapped_x = 128 + ((raw_x - JOYSTICK_CENTER_X) * 128) / (JOYSTICK_CENTER_X > 2048 ? JOYSTICK_CENTER_X : 2048);
+    int mapped_y = 128 + ((raw_y - JOYSTICK_CENTER_Y) * 128) / (JOYSTICK_CENTER_Y > 2048 ? JOYSTICK_CENTER_Y : 2048);
+
+    // 限幅
+    if (mapped_x < 0) mapped_x = 0;
+    if (mapped_x > 255) mapped_x = 255;
+    if (mapped_y < 0) mapped_y = 0;
+    if (mapped_y > 255) mapped_y = 255;
+
+    *x = (uint8_t)mapped_x;
+    *y = (uint8_t)mapped_y;
     *btn = (gpio_get_level(JOYSTICK_BTN_GPIO) == 0) ? 1 : 0;
 }
 
