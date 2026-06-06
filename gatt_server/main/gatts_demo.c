@@ -1699,16 +1699,29 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
     switch (event) {
     case ESP_GATTS_REG_EVT:
         ESP_LOGI(GATTS_TAG, "GATT 注册成功, app_id=%d", param->reg.app_id);
-        
+
         // 设置设备名
         esp_ble_gap_set_device_name(owl_device_name);
-        
+
+        /*=== BLE 安全参数配置 (在GAP就绪后配置) ===*/
+        esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
+        esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
+        uint8_t auth_req = ESP_LE_AUTH_BOND;
+        esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
+        uint8_t key_size = 16;
+        esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
+        uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+        esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
+        uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
+        esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
+        ESP_LOGI(GATTS_TAG, "BLE 安全参数已配置 (Just Works, Bonding)");
+
         // 配置广播数据
         esp_ble_gap_config_adv_data(&adv_data);
         adv_config_done |= adv_config_flag;
         esp_ble_gap_config_adv_data(&scan_rsp_data);
         adv_config_done |= scan_rsp_config_flag;
-        
+
         // 创建服务
         gl_profile.service_id.is_primary = true;
         gl_profile.service_id.id.inst_id = 0x00;
@@ -1962,23 +1975,6 @@ void app_main(void) {
         ESP_LOGE(GATTS_TAG, "GAP 回调注册失败: %x", ret);
         return;
     }
-
-    /*=== BLE 安全参数配置 ===*/
-    // 设置 IO 能力为 No Input No Output（Just Works，无需用户输入配对码）
-    esp_ble_io_cap_t iocap = ESP_IO_CAP_NONE;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_IOCAP_MODE, &iocap, sizeof(iocap));
-    // 认证请求：Bonding + 无 MITM（Just Works 足够玩具场景）
-    uint8_t auth_req = ESP_LE_AUTH_BOND;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE, &auth_req, sizeof(auth_req));
-    // 密钥大小：默认最大 16 字节 (128-bit)
-    uint8_t key_size = 16;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_MAX_KEY_SIZE, &key_size, sizeof(key_size));
-    // 初始化密钥类型
-    uint8_t init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_INIT_KEY, &init_key, sizeof(init_key));
-    uint8_t rsp_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
-    esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &rsp_key, sizeof(rsp_key));
-    ESP_LOGI(GATTS_TAG, "BLE 安全参数已配置 (Just Works, Bonding)");
 
     // 注册应用
     ret = esp_ble_gatts_app_register(PROFILE_APP_ID);
