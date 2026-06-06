@@ -564,11 +564,6 @@ static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_
 
 // 发送ACK包
 static void send_ack(uint8_t cmd, uint8_t result) {
-    if (gl_profile.conn_id == 0) {
-        ESP_LOGW(GATTS_TAG, "send_ack: conn_id=0, 跳过");
-        return;
-    }
-    
     owl_ack_pkt_t pkt;
     pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_ACK);
     pkt.header.seq = feedback_seq++;
@@ -582,10 +577,10 @@ static void send_ack(uint8_t cmd, uint8_t result) {
                                  gl_profile.char_feedback_handle,
                                  sizeof(pkt), (uint8_t*)&pkt, false);
     if (rc != ESP_GATT_OK) {
-        ESP_LOGW(GATTS_TAG, "ACK indicate发送失败: rc=0x%x, gatts_if=%d, conn_id=%d, handle=%d",
-                 rc, gl_profile.gatts_if, gl_profile.conn_id, gl_profile.char_feedback_handle);
+        ESP_LOGW(GATTS_TAG, "ACK发送失败: rc=0x%x, conn_id=%d, handle=%d",
+                 rc, gl_profile.conn_id, gl_profile.char_feedback_handle);
     } else {
-        ESP_LOGI(GATTS_TAG, "ACK发送成功: cmd=0x%02X, handle=%d", cmd, gl_profile.char_feedback_handle);
+        ESP_LOGI(GATTS_TAG, "ACK发送成功: cmd=0x%02X", cmd);
     }
 }
 
@@ -1814,7 +1809,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event,
         break;
         
     case ESP_GATTS_CONNECT_EVT: {
-        ESP_LOGI(GATTS_TAG, "客户端连接, conn_id=%d", param->connect.conn_id);
+        ESP_LOGI(GATTS_TAG, "客户端连接, conn_id=%d, gatts_if=%d", param->connect.conn_id, gatts_if);
         ESP_LOGI(GATTS_TAG, "客户端 MAC: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(param->connect.remote_bda));
 
         // MAC 地址验证
