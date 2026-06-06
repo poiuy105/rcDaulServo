@@ -797,6 +797,7 @@ static void preset_player_task(void *arg) {
             g_preset_task_handle = NULL;
             xSemaphoreGive(g_state_mutex);
         }
+        esp_task_wdt_delete(NULL);
         vTaskDelete(NULL);
         return;
     }
@@ -812,6 +813,7 @@ static void preset_player_task(void *arg) {
             g_preset_task_handle = NULL;
             xSemaphoreGive(g_state_mutex);
         }
+        esp_task_wdt_delete(NULL);
         vTaskDelete(NULL);
         return;
     }
@@ -826,6 +828,7 @@ static void preset_player_task(void *arg) {
             g_preset_task_handle = NULL;
             xSemaphoreGive(g_state_mutex);
         }
+        esp_task_wdt_delete(NULL);
         vTaskDelete(NULL);
         return;
     }
