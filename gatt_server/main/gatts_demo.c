@@ -835,8 +835,15 @@ static void preset_player_task(void *arg) {
         ESP_LOGE(GATTS_TAG, "[预设] 读取帧数据失败: %s", esp_err_to_name(err));
         free(frames);
         nvs_close(nvs);
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_preset_running = false;
+            g_preset_task_handle = NULL;
+            xSemaphoreGive(g_state_mutex);
+        }
         send_event_notify(OWL_EVENT_PRESET_COMPLETED, local_slot, 0, 0);
         send_ack(OWL_CMD_PRESET_START, OWL_ERR_EXEC_FAILED);
+        esp_task_wdt_delete(NULL);
+        vTaskDelete(NULL);
         return;
     }
     nvs_close(nvs);
