@@ -1235,9 +1235,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
             save_bound_mac(param->open.remote_bda);
         }
 
-        // 主动发起 BLE 加密（Just Works）
-        esp_ble_set_encryption(param->open.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
-        ESP_LOGI(GATTC_TAG, "已发起BLE加密请求");
+        // 加密请求延迟到服务发现完成后发起（ESP_GATTC_SEARCH_CMPL_EVT）
+        // 避免加密过程与MTU交换/服务发现并发导致写入丢失
 
         // 更新连接参数：使用更宽松的间隔，降低断线概率
         // min_interval=30ms, max_interval=50ms, latency=0, timeout=500ms
@@ -1280,6 +1279,10 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
                 connect = true;
                 ESP_LOGI(GATTC_TAG, "开始发送测试数据...");
                 start_connection_tasks();
+
+                // 服务发现完成后发起 BLE 加密（避免与MTU交换/服务发现并发）
+                esp_ble_set_encryption(gl_profile.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
+                ESP_LOGI(GATTC_TAG, "已发起BLE加密请求");
             }
         }
         break;

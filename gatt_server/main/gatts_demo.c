@@ -564,7 +564,10 @@ static void send_event_notify(uint8_t event_code, uint8_t p1, uint8_t p2, uint8_
 
 // 发送ACK包
 static void send_ack(uint8_t cmd, uint8_t result) {
-    if (gl_profile.conn_id == 0) return;
+    if (gl_profile.conn_id == 0) {
+        ESP_LOGW(GATTS_TAG, "send_ack: conn_id=0, 跳过");
+        return;
+    }
     
     owl_ack_pkt_t pkt;
     pkt.header.version_type = OWL_MAKE_HEADER(OWL_PKT_ACK);
@@ -579,7 +582,8 @@ static void send_ack(uint8_t cmd, uint8_t result) {
                                  gl_profile.char_feedback_handle,
                                  sizeof(pkt), (uint8_t*)&pkt, false);
     if (rc != ESP_GATT_OK) {
-        ESP_LOGW(GATTS_TAG, "indicate发送失败: 0x%x", rc);
+        ESP_LOGW(GATTS_TAG, "ACK indicate发送失败: rc=0x%x, gatts_if=%d, conn_id=%d, handle=%d",
+                 rc, gl_profile.gatts_if, gl_profile.conn_id, gl_profile.char_feedback_handle);
     }
 }
 
